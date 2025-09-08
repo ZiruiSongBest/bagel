@@ -1,0 +1,181 @@
+{
+  "description": "统一生成训练数据格式示例",
+  "supported_formats": {
+    "conversation_format": {
+      "description": "对话格式，支持用户和助手的多轮交互",
+      "example": {
+        "conversations": [
+          {
+            "role": "user",
+            "type": "text",
+            "content": "请生成一张猫戴帽子的图片"
+          },
+          {
+            "role": "assistant", 
+            "type": "image",
+            "image_path": "/path/to/cat_with_hat.jpg"
+          },
+          {
+            "role": "user",
+            "type": "text",
+            "content": "请描述这张图片"
+          },
+          {
+            "role": "assistant",
+            "type": "text", 
+            "content": "这是一张可爱的小猫戴着红色帽子的图片，小猫看起来很开心。"
+          }
+        ],
+        "metadata": {
+          "task_type": "text_to_image_to_text",
+          "difficulty": "medium"
+        }
+      }
+    },
+    
+    "direct_sequence_format": {
+      "description": "直接序列格式，明确指定输入和目标序列",
+      "example": {
+        "input_sequence": [
+          {
+            "type": "text",
+            "content": "Edit this image: add a hat to the cat"
+          },
+          {
+            "type": "image", 
+            "image_path": "/path/to/original_cat.jpg"
+          }
+        ],
+        "target_sequence": [
+          {
+            "type": "image",
+            "image_path": "/path/to/cat_with_hat.jpg"
+          }
+        ],
+        "metadata": {
+          "task_type": "image_editing",
+          "edit_type": "add_object"
+        }
+      }
+    },
+    
+    "text_to_image_format": {
+      "description": "文本到图像生成格式",
+      "example": {
+        "text_prompt": "A beautiful sunset over the ocean with sailing boats",
+        "image_path": "/path/to/sunset_ocean.jpg",
+        "metadata": {
+          "task_type": "text_to_image",
+          "style": "realistic",
+          "resolution": "1024x1024"
+        }
+      }
+    },
+    
+    "image_to_text_format": {
+      "description": "图像到文本生成格式（图像描述）",
+      "example": {
+        "image_path": "/path/to/landscape.jpg",
+        "caption": "A scenic mountain landscape with a lake reflecting the snow-capped peaks under a clear blue sky.",
+        "metadata": {
+          "task_type": "image_to_text",
+          "caption_type": "detailed_description"
+        }
+      }
+    },
+    
+    "multi_step_editing_format": {
+      "description": "多步骤图像编辑格式",
+      "example": {
+        "input_image": "/path/to/original_cat.jpg",
+        "editing_steps": [
+          {
+            "step": 1,
+            "instruction": "Add a red hat to the cat",
+            "result_image": "/path/to/cat_with_hat.jpg"
+          },
+          {
+            "step": 2, 
+            "instruction": "Make the cat sit by a river",
+            "result_image": "/path/to/cat_hat_river.jpg"
+          },
+          {
+            "step": 3,
+            "instruction": "Change the style to watercolor painting",
+            "result_image": "/path/to/cat_hat_river_watercolor.jpg"
+          }
+        ],
+        "metadata": {
+          "task_type": "multi_step_editing",
+          "num_steps": 3,
+          "base_object": "cat"
+        }
+      }
+    },
+    
+    "interleaved_format": {
+      "description": "交错的文本和图像序列",
+      "example": {
+        "sequence": [
+          {
+            "type": "text",
+            "content": "Let me show you how to make a painting step by step."
+          },
+          {
+            "type": "image",
+            "image_path": "/path/to/step1_sketch.jpg"
+          },
+          {
+            "type": "text", 
+            "content": "First, I draw a basic sketch."
+          },
+          {
+            "type": "image",
+            "image_path": "/path/to/step2_colors.jpg"
+          },
+          {
+            "type": "text",
+            "content": "Then I add colors and details."
+          },
+          {
+            "type": "image",
+            "image_path": "/path/to/step3_final.jpg"
+          },
+          {
+            "type": "text",
+            "content": "Finally, here's the completed painting!"
+          }
+        ],
+        "metadata": {
+          "task_type": "interleaved_generation",
+          "instruction_type": "tutorial"
+        }
+      }
+    }
+  },
+  
+  "data_preprocessing_notes": {
+    "image_requirements": {
+      "supported_formats": ["jpg", "jpeg", "png", "bmp"],
+      "recommended_resolution": "1024x1024",
+      "max_file_size": "10MB"
+    },
+    "text_requirements": {
+      "max_length": 2048,
+      "encoding": "utf-8",
+      "language_support": ["en", "zh", "multilingual"]
+    },
+    "path_conventions": {
+      "absolute_paths": "推荐使用绝对路径",
+      "relative_paths": "相对于数据文件的路径",
+      "url_support": "支持HTTP/HTTPS URL"
+    }
+  },
+  
+  "training_considerations": {
+    "batch_size": "建议使用batch_size=1，因为序列长度差异很大",
+    "memory_usage": "大图像和长序列会占用大量内存",
+    "data_balance": "建议平衡文本生成和图像生成的样本数量",
+    "augmentation": "可以考虑数据增强，如图像变换、文本改写等"
+  }
+}
