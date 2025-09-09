@@ -26,7 +26,7 @@ python train_unified_generation.py \
     --train_data_path /remote-home/hanmf/test/bagel/dataset/demo/demo_sample/anno.json \
     --batch_size 1 \
     --gradient_accumulation_steps 64 \
-    --num_epochs 3 \
+    --num_epochs 100 \
     --learning_rate 1e-5 \
     --output_dir ./outputs/modelparallel_training \
     --logging_steps 10 \
