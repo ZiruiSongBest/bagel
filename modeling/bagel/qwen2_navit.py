@@ -18,6 +18,13 @@ import torch
 from torch import nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.nn.attention.flex_attention import flex_attention
+
+
+def ensure_same_device(indexes_tensor, reference_tensor):
+    """确保索引张量与参考张量在同一设备上"""
+    if hasattr(indexes_tensor, 'device') and indexes_tensor.device != reference_tensor.device:
+        return indexes_tensor.to(reference_tensor.device)
+    return indexes_tensor
 from torch.nn.functional import scaled_dot_product_attention
 from transformers.utils import ModelOutput
 
@@ -412,6 +419,10 @@ class PackedAttentionMoT(Qwen2Attention):
         packed_und_token_indexes: torch.LongTensor,
         packed_gen_token_indexes: torch.LongTensor,
     ):
+        # 确保索引张量与数据张量在同一设备上
+        packed_und_token_indexes = ensure_same_device(packed_und_token_indexes, packed_sequence)
+        packed_gen_token_indexes = ensure_same_device(packed_gen_token_indexes, packed_sequence)
+        
         packed_query_states = packed_sequence.new_zeros((packed_sequence.shape[0], self.num_heads * self.head_dim))
         packed_key_states = packed_sequence.new_zeros((packed_sequence.shape[0], self.num_key_value_heads * self.head_dim))
         packed_value_states = packed_sequence.new_zeros((packed_sequence.shape[0], self.num_key_value_heads * self.head_dim))
@@ -719,6 +730,9 @@ class Qwen2MoTDecoderLayer(nn.Module):
         packed_und_token_indexes: torch.LongTensor,
         packed_gen_token_indexes: torch.LongTensor,
     ) -> torch.Tensor:
+        # 确保索引张量与数据张量在同一设备上
+        packed_und_token_indexes = ensure_same_device(packed_und_token_indexes, packed_sequence)
+        packed_gen_token_indexes = ensure_same_device(packed_gen_token_indexes, packed_sequence)
 
         residual = packed_sequence
         packed_sequence_ = packed_sequence.new_zeros(packed_sequence.shape)
@@ -976,8 +990,13 @@ class Qwen2Model(Qwen2PreTrainedModel):
         packed_und_token_indexes: Optional[torch.LongTensor] = None,
         packed_gen_token_indexes: Optional[torch.LongTensor] = None,
     ) -> torch.Tensor:
+        # 确保索引张量与数据张量在同一设备上
+        if packed_und_token_indexes is not None:
+            packed_und_token_indexes = ensure_same_device(packed_und_token_indexes, packed_sequence)
+        if packed_gen_token_indexes is not None:
+            packed_gen_token_indexes = ensure_same_device(packed_gen_token_indexes, packed_sequence)
 
-        if self.config.freeze_und:
+        if self.config.freeze_und and packed_und_token_indexes is not None:
             packed_sequence[packed_und_token_indexes] = packed_sequence[packed_und_token_indexes].detach()
 
         # create position embeddings to be shared across the decoder layers
@@ -1007,6 +1026,10 @@ class Qwen2Model(Qwen2PreTrainedModel):
 
         if self.use_moe:
             packed_sequence_ = torch.zeros_like(packed_sequence)
+            # 确保索引张量与数据张量在同一设备上
+            packed_und_token_indexes = ensure_same_device(packed_und_token_indexes, packed_sequence)
+            packed_gen_token_indexes = ensure_same_device(packed_gen_token_indexes, packed_sequence)
+                
             packed_sequence_[packed_und_token_indexes] = self.norm(packed_sequence[packed_und_token_indexes])
             if self.config.freeze_und:
                 packed_sequence_[packed_und_token_indexes] = packed_sequence_[packed_und_token_indexes].detach()

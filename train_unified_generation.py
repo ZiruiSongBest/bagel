@@ -26,6 +26,7 @@ import os
 import sys
 import json
 import torch
+import torch.distributed as dist
 import argparse
 import logging
 from pathlib import Path
@@ -44,12 +45,32 @@ from training.unified_trainer import UnifiedTrainer, UnifiedTrainingConfig
 from accelerate import infer_auto_device_map, load_checkpoint_and_dispatch, init_empty_weights
 
 
-def setup_logging():
+def setup_distributed():
+    """设置分布式训练环境"""
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        rank = int(os.environ["RANK"])
+        world_size = int(os.environ['WORLD_SIZE'])
+        local_rank = int(os.environ['LOCAL_RANK'])
+    elif 'SLURM_PROCID' in os.environ:
+        rank = int(os.environ['SLURM_PROCID'])
+        world_size = int(os.environ['SLURM_NTASKS'])
+        local_rank = rank % torch.cuda.device_count()
+    else:
+        print("不使用分布式训练")
+        return False, 0, 1, 0
+    
+    torch.cuda.set_device(local_rank)
+    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
+    return True, rank, world_size, local_rank
+
+
+def setup_logging(rank=0):
     """设置日志"""
+    log_level = logging.INFO if rank == 0 else logging.WARNING
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
         datefmt="%m/%d/%Y %H:%M:%S",
-        level=logging.INFO,
+        level=log_level,
     )
 
 
@@ -148,18 +169,21 @@ def set_seed(seed: int):
     torch.cuda.manual_seed_all(seed)
 
 
-def load_bagel_model(model_path: str, mode: int = 1):
+def load_bagel_model(model_path: str, mode: int = 1, use_ddp: bool = False, rank: int = 0):
     """
     加载BAGEL模型
     
     Args:
         model_path: 模型路径
         mode: 加载模式 (1=normal, 2=NF4, 3=INT8)
+        use_ddp: 是否使用分布式训练
+        rank: 当前进程rank
     
     Returns:
         tuple: (model, vae_model, tokenizer, vae_transform, vit_transform, new_token_ids)
     """
-    logging.info(f"开始加载BAGEL模型，路径: {model_path}")
+    if rank == 0:
+        logging.info(f"开始加载BAGEL模型，路径: {model_path}")
     
     # 加载配置
     llm_config = Qwen2Config.from_json_file(os.path.join(model_path, "llm_config.json"))
@@ -200,10 +224,10 @@ def load_bagel_model(model_path: str, mode: int = 1):
     vae_transform = ImageTransform(1024, 512, 16)
     vit_transform = ImageTransform(980, 224, 14)
 
-    # 设备映射和模型加载
+    # 设备映射和模型加载 - 对于大模型总是使用模型并行
     device_map = infer_auto_device_map(
         model,
-        max_memory={i: "80GiB" for i in range(torch.cuda.device_count())},
+        max_memory={i: "30GiB" for i in range(torch.cuda.device_count())},
         no_split_module_classes=["Bagel", "Qwen2MoTDecoderLayer"],
     )
 
@@ -225,14 +249,24 @@ def load_bagel_model(model_path: str, mode: int = 1):
             else:
                 device_map[k] = "cuda:0"
     else:
-        first_device = device_map.get(same_device_modules[0])
+        # 多GPU情况下，允许模型分布在多个设备上，但确保关键模块在同一设备
+        first_device = device_map.get(same_device_modules[0], "cuda:0")
         for k in same_device_modules:
             if k in device_map:
+                device_map[k] = first_device
+            else:
                 device_map[k] = first_device
 
     # 根据模式加载模型权重
     if mode == 1:
-        logging.info("使用标准模式加载模型...")
+        if rank == 0:
+            logging.info("使用标准模式加载模型...")
+        
+        # 对于大模型，总是使用accelerate的模型并行
+        # 76GB模型无法在单张80GB GPU上完整加载，需要跨GPU分布
+        if rank == 0:
+            logging.info("使用accelerate模型并行加载大模型...")
+        
         model = load_checkpoint_and_dispatch(
             model,
             checkpoint=os.path.join(model_path, "ema.safetensors"),
@@ -243,7 +277,12 @@ def load_bagel_model(model_path: str, mode: int = 1):
             force_hooks=True,
         ).eval()
     elif mode == 2:  # NF4
-        logging.info("使用NF4量化模式加载模型...")
+        if rank == 0:
+            logging.info("使用NF4量化模式加载模型...")
+        
+        if use_ddp:
+            raise NotImplementedError("量化模式暂不支持分布式训练，请使用mode=1")
+        
         from accelerate.utils import BnbQuantizationConfig, load_and_quantize_model
         bnb_quantization_config = BnbQuantizationConfig(
             load_in_4bit=True, 
@@ -259,7 +298,12 @@ def load_bagel_model(model_path: str, mode: int = 1):
             offload_folder="offload",
         ).eval()
     elif mode == 3:  # INT8
-        logging.info("使用INT8量化模式加载模型...")
+        if rank == 0:
+            logging.info("使用INT8量化模式加载模型...")
+        
+        if use_ddp:
+            raise NotImplementedError("量化模式暂不支持分布式训练，请使用mode=1")
+        
         from accelerate.utils import BnbQuantizationConfig, load_and_quantize_model
         bnb_quantization_config = BnbQuantizationConfig(
             load_in_8bit=True, 
@@ -275,11 +319,15 @@ def load_bagel_model(model_path: str, mode: int = 1):
     else:
         raise NotImplementedError(f"模式 {mode} 未实现")
     
+    # 对于大模型，我们使用accelerate的模型并行，不使用DDP
+    # DDP需要每个GPU都有完整模型副本，但这个模型太大了
+    
     # 设置为训练模式
     model.train()
     
-    logging.info("模型加载完成！")
-    logging.info(f"新增的特殊token ID: {new_token_ids}")
+    if rank == 0:
+        logging.info("模型加载完成！")
+        logging.info(f"新增的特殊token ID: {new_token_ids}")
     
     return model, vae_model, tokenizer, vae_transform, vit_transform, new_token_ids
 
@@ -333,15 +381,18 @@ def create_training_config(args) -> UnifiedTrainingConfig:
 
 def main():
     """主函数"""
+    # 设置分布式训练
+    use_ddp, rank, world_size, local_rank = setup_distributed()
+    
     # 设置日志
-    setup_logging()
+    setup_logging(rank)
     logger = logging.getLogger(__name__)
     
     # 解析参数
     args = parse_args()
     
     # 设置随机种子
-    set_seed(args.seed)
+    set_seed(args.seed + rank)  # 不同进程使用不同种子
     
     # 检查数据路径
     if not os.path.exists(args.train_data_path):
@@ -350,32 +401,45 @@ def main():
     if args.val_data_path and not os.path.exists(args.val_data_path):
         raise FileNotFoundError(f"验证数据路径不存在: {args.val_data_path}")
     
-    # 创建输出目录
-    os.makedirs(args.output_dir, exist_ok=True)
+    # 创建输出目录（只在主进程中创建）
+    if rank == 0:
+        os.makedirs(args.output_dir, exist_ok=True)
+        
+        # 保存参数
+        with open(os.path.join(args.output_dir, "training_args.json"), 'w') as f:
+            json.dump(vars(args), f, indent=2)
+        
+        logger.info("=" * 60)
+        logger.info("开始统一生成模型训练")
+        logger.info("=" * 60)
+        logger.info(f"使用分布式训练: {use_ddp}")
+        if use_ddp:
+            logger.info(f"总进程数: {world_size}")
+            logger.info(f"当前进程rank: {rank}")
+            logger.info(f"本地rank: {local_rank}")
+        logger.info(f"模型路径: {args.model_path}")
+        logger.info(f"训练数据: {args.train_data_path}")
+        logger.info(f"验证数据: {args.val_data_path}")
+        logger.info(f"输出目录: {args.output_dir}")
+        logger.info(f"批次大小: {args.batch_size}")
+        logger.info(f"梯度累积步数: {args.gradient_accumulation_steps}")
+        logger.info(f"训练轮数: {args.num_epochs}")
+        logger.info(f"学习率: {args.learning_rate}")
+        logger.info("=" * 60)
     
-    # 保存参数
-    with open(os.path.join(args.output_dir, "training_args.json"), 'w') as f:
-        json.dump(vars(args), f, indent=2)
-    
-    logger.info("=" * 60)
-    logger.info("开始统一生成模型训练")
-    logger.info("=" * 60)
-    logger.info(f"模型路径: {args.model_path}")
-    logger.info(f"训练数据: {args.train_data_path}")
-    logger.info(f"验证数据: {args.val_data_path}")
-    logger.info(f"输出目录: {args.output_dir}")
-    logger.info(f"批次大小: {args.batch_size}")
-    logger.info(f"梯度累积步数: {args.gradient_accumulation_steps}")
-    logger.info(f"训练轮数: {args.num_epochs}")
-    logger.info(f"学习率: {args.learning_rate}")
-    logger.info("=" * 60)
+    # 同步所有进程
+    if use_ddp:
+        dist.barrier()
     
     try:
         # 加载模型
-        logger.info("正在加载模型...")
+        if rank == 0:
+            logger.info("正在加载模型...")
         model, vae_model, tokenizer, vae_transform, vit_transform, new_token_ids = load_bagel_model(
             model_path=args.model_path,
-            mode=args.model_load_mode
+            mode=args.model_load_mode,
+            use_ddp=use_ddp,
+            rank=rank
         )
         
         # 创建训练配置
@@ -390,20 +454,24 @@ def main():
             vit_transform=vit_transform,
             new_token_ids=new_token_ids,
             config=training_config,
+            use_ddp=use_ddp,
+            rank=rank,
+            world_size=world_size,
         )
         
         # 从检查点恢复（如果指定）
-        if args.resume_from_checkpoint:
+        if args.resume_from_checkpoint and rank == 0:
             logger.info(f"从检查点恢复训练: {args.resume_from_checkpoint}")
             trainer.load_checkpoint(args.resume_from_checkpoint)
         
         # 开始训练
         trainer.train()
         
-        logger.info("=" * 60)
-        logger.info("训练完成！")
-        logger.info(f"最终模型保存在: {args.output_dir}")
-        logger.info("=" * 60)
+        if rank == 0:
+            logger.info("=" * 60)
+            logger.info("训练完成！")
+            logger.info(f"最终模型保存在: {args.output_dir}")
+            logger.info("=" * 60)
         
     except KeyboardInterrupt:
         logger.info("训练被用户中断")

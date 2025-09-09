@@ -97,6 +97,9 @@ class UnifiedTrainer:
         vit_transform,
         new_token_ids: Dict[str, int],
         config: UnifiedTrainingConfig,
+        use_ddp: bool = False,
+        rank: int = 0,
+        world_size: int = 1,
     ):
         self.model = model
         self.vae_model = vae_model
@@ -105,11 +108,19 @@ class UnifiedTrainer:
         self.vit_transform = vit_transform
         self.new_token_ids = new_token_ids
         self.config = config
+        self.use_ddp = use_ddp
+        self.rank = rank
+        self.world_size = world_size
         
         # 设置设备
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model.to(self.device)
-        self.vae_model.to(self.device)
+        if use_ddp:
+            self.device = torch.device(f"cuda:{torch.cuda.current_device()}")
+        else:
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        # VAE模型始终移动到当前设备
+        if hasattr(self.vae_model, 'to'):
+            self.vae_model.to(self.device)
         
         # 设置日志
         self._setup_logging()
@@ -131,6 +142,7 @@ class UnifiedTrainer:
         self.image_criterion = nn.MSELoss()
         
         # 实验跟踪
+        self.wandb_initialized = False
         if config.wandb_project:
             self._init_wandb()
     
@@ -151,8 +163,10 @@ class UnifiedTrainer:
                 name=self.config.wandb_run_name,
                 config=self.config.to_dict(),
             )
+            self.wandb_initialized = True
             self.logger.info("W&B initialized successfully")
         except Exception as e:
+            self.wandb_initialized = False
             self.logger.warning(f"Failed to initialize W&B: {e}")
     
     def _create_optimizer(self) -> torch.optim.Optimizer:
@@ -197,6 +211,7 @@ class UnifiedTrainer:
     def get_train_dataloader(self) -> DataLoader:
         """获取训练数据加载器"""
         from training.unified_data_processor import create_unified_dataloader
+        from torch.utils.data import DistributedSampler
         
         train_dataset = UnifiedGenerationDataset(
             data_path=self.config.train_data_path,
@@ -208,10 +223,23 @@ class UnifiedTrainer:
             max_image_tokens=self.config.max_image_tokens,
         )
         
+        # 分布式采样器
+        sampler = None
+        shuffle = True
+        if self.use_ddp:
+            sampler = DistributedSampler(
+                train_dataset,
+                num_replicas=self.world_size,
+                rank=self.rank,
+                shuffle=True
+            )
+            shuffle = False  # 使用sampler时不能设置shuffle
+        
         return create_unified_dataloader(
             train_dataset,
             batch_size=self.config.batch_size,
-            shuffle=True,
+            shuffle=shuffle,
+            sampler=sampler,
             num_workers=self.config.dataloader_num_workers,
         )
     
@@ -221,6 +249,7 @@ class UnifiedTrainer:
             return None
             
         from training.unified_data_processor import create_unified_dataloader
+        from torch.utils.data import DistributedSampler
         
         val_dataset = UnifiedGenerationDataset(
             data_path=self.config.val_data_path,
@@ -232,16 +261,28 @@ class UnifiedTrainer:
             max_image_tokens=self.config.max_image_tokens,
         )
         
+        # 分布式采样器（验证时不打乱）
+        sampler = None
+        if self.use_ddp:
+            sampler = DistributedSampler(
+                val_dataset,
+                num_replicas=self.world_size,
+                rank=self.rank,
+                shuffle=False
+            )
+        
         return create_unified_dataloader(
             val_dataset,
             batch_size=1,  # 验证时使用batch_size=1
             shuffle=False,
+            sampler=sampler,
             num_workers=self.config.dataloader_num_workers,
         )
     
     def train(self):
         """主训练循环"""
-        self.logger.info("开始训练...")
+        if self.rank == 0:
+            self.logger.info("开始训练...")
         
         # 获取数据加载器
         train_dataloader = self.get_train_dataloader()
@@ -257,14 +298,21 @@ class UnifiedTrainer:
         # 训练循环
         for epoch in range(self.config.num_epochs):
             self.epoch = epoch
-            self.logger.info(f"开始训练 Epoch {epoch + 1}/{self.config.num_epochs}")
+            
+            # 分布式训练时设置sampler的epoch
+            if self.use_ddp and hasattr(train_dataloader.sampler, 'set_epoch'):
+                train_dataloader.sampler.set_epoch(epoch)
+            
+            if self.rank == 0:
+                self.logger.info(f"开始训练 Epoch {epoch + 1}/{self.config.num_epochs}")
             
             epoch_loss = self._train_epoch(train_dataloader)
             
-            self.logger.info(f"Epoch {epoch + 1} 训练损失: {epoch_loss:.4f}")
+            if self.rank == 0:
+                self.logger.info(f"Epoch {epoch + 1} 训练损失: {epoch_loss:.4f}")
             
             # 验证
-            if eval_dataloader:
+            if eval_dataloader and self.rank == 0:  # 只在主进程进行验证
                 val_loss = self._evaluate(eval_dataloader)
                 self.logger.info(f"Epoch {epoch + 1} 验证损失: {val_loss:.4f}")
                 
@@ -273,13 +321,20 @@ class UnifiedTrainer:
                     self.best_val_loss = val_loss
                     self._save_checkpoint("best_model")
             
-            # 保存检查点
-            self._save_checkpoint(f"epoch_{epoch + 1}")
+            # 保存检查点（只在主进程）
+            if self.rank == 0:
+                self._save_checkpoint(f"epoch_{epoch + 1}")
+            
+            # 同步所有进程
+            if self.use_ddp:
+                import torch.distributed as dist
+                dist.barrier()
             
             if self.config.max_steps and self.global_step >= self.config.max_steps:
                 break
         
-        self.logger.info("训练完成!")
+        if self.rank == 0:
+            self.logger.info("训练完成!")
     
     def _train_epoch(self, train_dataloader: DataLoader) -> float:
         """训练一个epoch"""
@@ -332,7 +387,14 @@ class UnifiedTrainer:
     def _training_step(self, batch: Dict[str, Any]) -> Dict[str, float]:
         """单个训练步骤"""
         # 将数据移到设备上
-        batch = {k: v.to(self.device) if torch.is_tensor(v) else v 
+        if self.use_ddp:
+            # DDP模式：使用当前设备
+            device = self.device
+        else:
+            # 非DDP模式：使用模型的主设备
+            device = next(self.model.parameters()).device
+        
+        batch = {k: v.to(device) if torch.is_tensor(v) else v 
                 for k, v in batch.items()}
         
         # 准备模型输入
@@ -377,6 +439,12 @@ class UnifiedTrainer:
     
     def _prepare_model_inputs(self, batch: Dict[str, Any]) -> Dict[str, Any]:
         """准备模型输入"""
+        # 获取模型的主设备（对于模型并行很重要）
+        if self.use_ddp:
+            model_device = self.device
+        else:
+            model_device = next(self.model.parameters()).device
+            
         model_inputs = {
             'sequence_length': batch['sequence_length'],
             'packed_text_ids': batch['packed_text_ids'],
@@ -399,9 +467,14 @@ class UnifiedTrainer:
             if vit_tokens.dtype == torch.float32:
                 vit_tokens = vit_tokens.to(torch.bfloat16)
             
+            # 确保所有索引张量都在正确的设备上
+            vit_token_indexes = batch['packed_vit_token_indexes']
+            if hasattr(vit_token_indexes, 'device') and vit_token_indexes.device != model_device:
+                vit_token_indexes = vit_token_indexes.to(model_device)
+                
             model_inputs.update({
                 'packed_vit_tokens': vit_tokens,
-                'packed_vit_token_indexes': batch['packed_vit_token_indexes'],
+                'packed_vit_token_indexes': vit_token_indexes,
                 'packed_vit_position_ids': batch['packed_vit_position_ids'],
                 'vit_token_seqlens': batch['vit_token_seqlens'],
             })
@@ -421,19 +494,65 @@ class UnifiedTrainer:
             if timesteps.dtype == torch.float32:
                 timesteps = timesteps.to(torch.bfloat16)
             
+            # 确保VAE索引张量都在正确的设备上
+            vae_token_indexes = batch['packed_vae_token_indexes']
+            if hasattr(vae_token_indexes, 'device') and vae_token_indexes.device != model_device:
+                vae_token_indexes = vae_token_indexes.to(model_device)
+            
             model_inputs.update({
                 'padded_latent': padded_latent,
                 'patchified_vae_latent_shapes': batch['patchified_vae_latent_shapes'],
                 'packed_latent_position_ids': batch['packed_vae_position_ids'],
-                'packed_vae_token_indexes': batch['packed_vae_token_indexes'],
+                'packed_vae_token_indexes': vae_token_indexes,
                 'packed_timesteps': timesteps,
             })
         
-        # 添加损失掩码
+        # 添加损失掩码 - 确保所有损失相关的张量都在正确设备上
+        ce_loss_indexes = batch['text_loss_mask']
+        mse_loss_indexes = batch['image_loss_mask']
+        
+        if hasattr(ce_loss_indexes, 'device') and ce_loss_indexes.device != model_device:
+            ce_loss_indexes = ce_loss_indexes.to(model_device)
+        if hasattr(mse_loss_indexes, 'device') and mse_loss_indexes.device != model_device:
+            mse_loss_indexes = mse_loss_indexes.to(model_device)
+            
+        # 处理标签数据 - 修复数据格式不兼容问题
+        if 'packed_label_ids' in batch:
+            # 如果batch中有专门的packed_label_ids，直接使用
+            packed_label_ids = batch['packed_label_ids']
+        else:
+            # 统一数据处理器使用text_loss_mask而不是原始的ce_loss_indexes格式
+            # 我们需要将text_loss_mask转换为与原始PackedDataset兼容的格式
+            packed_text_ids = batch['packed_text_ids']
+            
+            # 对于统一数据处理器，我们直接使用packed_text_ids作为标签
+            # 但需要确保与ce_loss_indexes长度匹配
+            if len(packed_text_ids) == ce_loss_indexes.sum().item():
+                # 如果长度匹配，直接使用
+                packed_label_ids = packed_text_ids
+            else:
+                # 如果长度不匹配，说明ce_loss_indexes是掩码形式
+                # 创建与ce_loss_indexes长度相同的标签序列，然后提取需要的部分
+                device = packed_text_ids.device
+                # 创建一个与sequence_length相同长度的标签序列
+                full_sequence_length = len(ce_loss_indexes)
+                if len(packed_text_ids) < full_sequence_length:
+                    # 如果packed_text_ids较短，用padding扩展
+                    padding_length = full_sequence_length - len(packed_text_ids)
+                    pad_token = packed_text_ids[0]  # 使用第一个token作为padding
+                    padding = torch.full((padding_length,), pad_token, device=device, dtype=packed_text_ids.dtype)
+                    full_labels = torch.cat([packed_text_ids, padding])
+                else:
+                    # 如果packed_text_ids较长，截断到合适长度
+                    full_labels = packed_text_ids[:full_sequence_length]
+                
+                # 只取ce_loss_indexes为True的位置作为标签
+                packed_label_ids = full_labels[ce_loss_indexes]
+        
         model_inputs.update({
-            'ce_loss_indexes': batch['text_loss_mask'],
-            'mse_loss_indexes': batch['image_loss_mask'],
-            'packed_label_ids': batch['packed_text_ids'],  # 标签与输入文本相同
+            'ce_loss_indexes': ce_loss_indexes,
+            'mse_loss_indexes': mse_loss_indexes,
+            'packed_label_ids': packed_label_ids,
         })
         
         return model_inputs
@@ -470,7 +589,8 @@ class UnifiedTrainer:
         
         with torch.no_grad():
             for batch in tqdm(eval_dataloader, desc="验证中"):
-                batch = {k: v.to(self.device) if torch.is_tensor(v) else v 
+                main_device = next(self.model.parameters()).device
+                batch = {k: v.to(main_device) if torch.is_tensor(v) else v 
                         for k, v in batch.items()}
                 
                 model_inputs = self._prepare_model_inputs(batch)
@@ -495,7 +615,7 @@ class UnifiedTrainer:
             'train/epoch': self.epoch,
         }
         
-        if hasattr(wandb, 'log'):
+        if self.wandb_initialized and hasattr(wandb, 'log'):
             wandb.log(metrics)
         
         self.logger.info(
@@ -507,11 +627,17 @@ class UnifiedTrainer:
     
     def _save_checkpoint(self, checkpoint_name: str):
         """保存检查点"""
+        if self.rank != 0:  # 只在主进程保存
+            return
+            
         checkpoint_dir = Path(self.config.output_dir) / checkpoint_name
         checkpoint_dir.mkdir(exist_ok=True)
         
-        # 保存模型
-        torch.save(self.model.state_dict(), checkpoint_dir / "model.pt")
+        # 保存模型（如果是DDP，需要保存原始模型）
+        if self.use_ddp:
+            torch.save(self.model.module.state_dict(), checkpoint_dir / "model.pt")
+        else:
+            torch.save(self.model.state_dict(), checkpoint_dir / "model.pt")
         
         # 保存优化器和调度器状态
         torch.save({

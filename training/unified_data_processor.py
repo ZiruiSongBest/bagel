@@ -646,6 +646,7 @@ def create_unified_dataloader(
     shuffle: bool = True,
     num_workers: int = 4,
     collate_fn=None,
+    sampler=None,
 ) -> DataLoader:
     """创建统一生成的数据加载器"""
     
@@ -656,6 +657,7 @@ def create_unified_dataloader(
         dataset,
         batch_size=batch_size,
         shuffle=shuffle,
+        sampler=sampler,
         num_workers=num_workers,
         collate_fn=collate_fn,
         pin_memory=True,
