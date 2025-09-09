@@ -130,6 +130,8 @@ def parse_args():
                        help="日志记录间隔")
     parser.add_argument("--save_steps", type=int, default=500,
                        help="保存间隔")
+    parser.add_argument("--save_epochs", type=int, default=1,
+                       help="每多少个epoch保存一次权重，1表示每个epoch都保存")
     parser.add_argument("--eval_steps", type=int, default=200,
                        help="验证间隔")
     parser.add_argument("--save_total_limit", type=int, default=3,
@@ -364,6 +366,7 @@ def create_training_config(args) -> UnifiedTrainingConfig:
         output_dir=args.output_dir,
         logging_steps=args.logging_steps,
         save_steps=args.save_steps,
+        save_epochs=args.save_epochs,
         eval_steps=args.eval_steps,
         save_total_limit=args.save_total_limit,
         

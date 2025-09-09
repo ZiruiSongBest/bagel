@@ -31,6 +31,7 @@ python train_unified_generation.py \
     --output_dir ./outputs/modelparallel_training \
     --logging_steps 10 \
     --save_steps 100 \
+    --save_epochs 50 \
     --model_load_mode 1 \
     --fp16 \
     --dataloader_num_workers 0 \

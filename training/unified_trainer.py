@@ -64,6 +64,7 @@ class UnifiedTrainingConfig:
     output_dir: str = "./outputs"
     logging_steps: int = 10
     save_steps: int = 500
+    save_epochs: int = 1  # 每多少个epoch保存一次，1表示每个epoch都保存
     eval_steps: int = 200
     save_total_limit: int = 3
     
@@ -321,8 +322,8 @@ class UnifiedTrainer:
                     self.best_val_loss = val_loss
                     self._save_checkpoint("best_model")
             
-            # 保存检查点（只在主进程）
-            if self.rank == 0:
+            # 保存检查点（只在主进程）- 根据save_epochs间隔保存
+            if self.rank == 0 and (epoch + 1) % self.config.save_epochs == 0:
                 self._save_checkpoint(f"epoch_{epoch + 1}")
             
             # 同步所有进程
