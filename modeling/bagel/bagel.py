@@ -238,6 +238,386 @@ class Bagel(PreTrainedModel):
 
         return dict(mse=mse, ce=ce)
 
+    def forward_autoregressive_training(
+        self,
+        input_text: str,
+        input_image: torch.Tensor,
+        target_tokens: List[int],
+        target_images: List[torch.Tensor],
+        tokenizer,
+        vae_model,
+        new_token_ids: Dict[str, int],
+    ) -> Dict[str, torch.Tensor]:
+        """
+        自回归序列生成的训练前向传播
+        
+        Args:
+            input_text: 输入文本
+            input_image: 输入图像 (已经过vit_transform处理)
+            target_tokens: 已经tokenize的目标序列，包含文本token和vision token
+            target_images: 与<|vision_start|>标记对应的图像张量列表 (已经过vae_transform处理)
+            tokenizer: 分词器
+            vae_model: VAE模型
+            new_token_ids: 特殊token的ID映射
+        
+        Returns:
+            包含各步骤损失的字典
+        """
+        device = next(self.parameters()).device
+        
+        # 1. 处理输入部分
+        input_sequence, input_indexes, current_pos = self._process_input_stage(
+            input_text, input_image, tokenizer, device
+        )
+        
+        # 2. 解析目标序列，识别文本和图像标记的位置
+        parsed_sequence = self._parse_target_sequence(target_tokens, target_images, new_token_ids, tokenizer)
+        
+        # 存储所有损失
+        step_losses = {"text_losses": [], "image_losses": []}
+        
+        # 当前的完整序列
+        full_sequence = input_sequence.clone()
+        
+        # 3. 按照解析后的序列顺序进行自回归生成和训练
+        for step_info in parsed_sequence:
+            if step_info["type"] == "text":
+                text_loss, new_sequence = self._process_text_generation_step(
+                    full_sequence, step_info["content"], tokenizer, current_pos, device
+                )
+                step_losses["text_losses"].append(text_loss)
+                full_sequence = new_sequence
+                current_pos += 1
+            elif step_info["type"] == "image":
+                image_loss, new_sequence = self._process_image_generation_step(
+                    full_sequence, step_info["content"], vae_model, current_pos, device
+                )
+                step_losses["image_losses"].append(image_loss)
+                full_sequence = new_sequence
+                current_pos += 1
+        
+        # 3. 汇总损失
+        total_text_loss = torch.stack(step_losses["text_losses"]).mean() if step_losses["text_losses"] else torch.tensor(0.0, device=device)
+        total_image_loss = torch.stack(step_losses["image_losses"]).mean() if step_losses["image_losses"] else torch.tensor(0.0, device=device)
+        
+        return {
+            "text_loss": total_text_loss,
+            "image_loss": total_image_loss,
+            "step_losses": step_losses
+        }
+    
+    def _process_input_stage(
+        self, 
+        input_text: str, 
+        input_image: torch.Tensor, 
+        tokenizer, 
+        device: torch.device
+    ) -> Tuple[torch.Tensor, List[int], int]:
+        """处理输入阶段：文本+图像"""
+        
+        # 1. 处理输入文本
+        text_ids = tokenizer.encode(input_text)
+        text_embedding = self.language_model.model.embed_tokens(torch.tensor(text_ids, device=device))
+        
+        # 2. 处理输入图像
+        if input_image.dim() == 3:
+            input_image = input_image.unsqueeze(0)  # 添加batch维度
+        
+        # 使用ViT处理输入图像
+        vit_position_ids = self.get_flattened_position_ids(
+            input_image.size(2), input_image.size(3),
+            self.vit_patch_size,
+            max_num_patches_per_side=self.vit_max_num_patch_per_side
+        ).to(device)
+        
+        vit_tokens = patchify(input_image.squeeze(0), self.vit_patch_size)
+        
+        # 使用ViT模型处理
+        cu_seqlens = torch.tensor([0, vit_tokens.shape[0]], dtype=torch.int32, device=device)
+        vit_embeddings = self.vit_model(
+            packed_pixel_values=vit_tokens,
+            packed_flattened_position_ids=vit_position_ids,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=vit_tokens.shape[0],
+        )
+        
+        # 应用连接器和位置编码
+        vit_embeddings = self.connector(vit_embeddings)
+        vit_pos_emb = self.vit_pos_embed(vit_position_ids)
+        vit_embeddings = vit_embeddings + vit_pos_emb
+        
+        # 3. 构建初始序列
+        input_sequence = torch.cat([text_embedding, vit_embeddings], dim=0)
+        input_indexes = list(range(len(text_ids) + len(vit_embeddings)))
+        
+        return input_sequence, input_indexes, 1  # position从1开始
+    
+    def _parse_target_sequence(
+        self, 
+        target_tokens: List[int], 
+        target_images: List[torch.Tensor],
+        new_token_ids: Dict[str, int],
+        tokenizer
+    ) -> List[Dict[str, any]]:
+        """
+        解析包含vision token的目标序列
+        
+        Args:
+            target_tokens: 已经tokenize的目标序列
+            target_images: 与<|vision_start|>标记对应的图像张量列表
+            new_token_ids: 特殊token的ID映射
+            tokenizer: 分词器
+        
+        Returns:
+            解析后的序列，每个元素包含type和content
+            例如: [{"type": "text", "content": [token_id1, token_id2, ...]}, 
+                  {"type": "image", "content": image_tensor},
+                  {"type": "text", "content": [token_id3, token_id4, ...]}]
+        """
+        parsed_sequence = []
+        image_idx = 0
+        current_text_tokens = []
+        
+        start_of_image = new_token_ids.get('start_of_image')
+        end_of_image = new_token_ids.get('end_of_image')
+        
+        i = 0
+        while i < len(target_tokens):
+            token_id = target_tokens[i]
+            
+            if token_id == start_of_image:
+                # 遇到图像开始token
+                
+                # 先保存之前积累的文本tokens
+                if current_text_tokens:
+                    parsed_sequence.append({
+                        "type": "text",
+                        "content": current_text_tokens.copy()
+                    })
+                    current_text_tokens = []
+                
+                # 查找对应的图像结束token
+                j = i + 1
+                while j < len(target_tokens) and target_tokens[j] != end_of_image:
+                    j += 1
+                
+                if j >= len(target_tokens):
+                    raise ValueError(f"找到<|vision_start|>但没有找到对应的<|vision_end|>")
+                
+                # 添加图像
+                if image_idx < len(target_images):
+                    parsed_sequence.append({
+                        "type": "image",
+                        "content": target_images[image_idx]
+                    })
+                    image_idx += 1
+                else:
+                    raise ValueError(f"目标序列中有 {image_idx + 1} 个图像标记，但只提供了 {len(target_images)} 张图像")
+                
+                # 跳过到end_of_image之后
+                i = j + 1
+                
+            else:
+                # 普通文本token
+                current_text_tokens.append(token_id)
+                i += 1
+        
+        # 保存最后的文本tokens
+        if current_text_tokens:
+            parsed_sequence.append({
+                "type": "text",
+                "content": current_text_tokens
+            })
+        
+        # 检查是否还有未使用的图像
+        if image_idx < len(target_images):
+            raise ValueError(f"提供了 {len(target_images)} 张图像，但目标序列中只有 {image_idx} 个图像标记")
+        
+        return parsed_sequence
+    
+    def forward_autoregressive_training_example(self):
+        """
+        使用示例：
+        
+        # 原来的方式（错误）：
+        target_texts = ["第一段思考", "第二段思考"]
+        target_images = [image1, image2]
+        
+        # 新的方式（正确）：
+        # 1. 原始文本序列包含<image>标记
+        target_sequence_text = "第一段思考 <image> 第二段思考 <image>"
+        
+        # 2. 通过数据处理器转换为tokenized序列，<image>被转换为<|vision_start|>和<|vision_end|>
+        # 例如: [token1, token2, start_of_image_id, end_of_image_id, token3, start_of_image_id, end_of_image_id]
+        target_tokens = tokenizer.encode(target_sequence_text)  # 这会由数据处理器处理
+        target_images = [image1, image2]
+        
+        # 3. 调用训练方法
+        loss = model.forward_autoregressive_training(
+            input_text="输入文本",
+            input_image=input_image,
+            target_tokens=target_tokens,  # 已经tokenized的序列
+            target_images=target_images,
+            tokenizer=tokenizer,
+            vae_model=vae_model,
+            new_token_ids=new_token_ids
+        )
+        
+        # 注意：现在系统会检测target_tokens中的start_of_image和end_of_image token ID
+        # 来决定何时生成图像，而不是固定的交替模式
+        """
+        pass
+    
+    def _process_text_generation_step(
+        self,
+        current_sequence: torch.Tensor,
+        target_tokens: List[int],
+        tokenizer,
+        position_id: int,
+        device: torch.device
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """处理文本生成步骤"""
+        
+        # 1. 目标token已经是ID列表，直接使用
+        target_ids = target_tokens
+        target_tensor = torch.tensor(target_ids, device=device)
+        
+        # 2. 为当前序列创建注意力掩码和位置ID
+        seq_len = current_sequence.size(0)
+        position_ids = torch.full((seq_len,), position_id, device=device)
+        
+        # 3. 前向传播
+        output = self.language_model(
+            packed_sequence=current_sequence.unsqueeze(0),  # 添加batch维度
+            sample_lens=[seq_len],
+            attention_mask=None,  # 使用默认因果掩码
+            packed_position_ids=position_ids,
+        )
+        
+        # 4. 计算文本损失（在序列末尾预测下一个文本token）
+        logits = self.language_model.lm_head(output)  # [1, seq_len, vocab_size]
+        
+        # 对每个目标token计算损失
+        text_losses = []
+        updated_sequence = current_sequence.clone()
+        
+        for i, target_id in enumerate(target_ids):
+            # 使用当前序列的最后一个位置预测下一个token
+            pred_logits = logits[0, -1, :]  # 最后一个位置的预测
+            loss = F.cross_entropy(pred_logits.unsqueeze(0), target_id.unsqueeze(0))
+            text_losses.append(loss)
+            
+            # 将预测的token添加到序列中
+            token_embedding = self.language_model.model.embed_tokens(target_id.unsqueeze(0))
+            updated_sequence = torch.cat([updated_sequence, token_embedding], dim=0)
+            
+            # 如果不是最后一个token，需要重新前向传播
+            if i < len(target_ids) - 1:
+                seq_len = updated_sequence.size(0)
+                position_ids = torch.full((seq_len,), position_id, device=device)
+                output = self.language_model(
+                    packed_sequence=updated_sequence.unsqueeze(0),
+                    sample_lens=[seq_len],
+                    attention_mask=None,
+                    packed_position_ids=position_ids,
+                )
+                logits = self.language_model.lm_head(output)
+        
+        text_loss = torch.stack(text_losses).mean()
+        return text_loss, updated_sequence
+    
+    def _process_image_generation_step(
+        self,
+        current_sequence: torch.Tensor,
+        target_image: torch.Tensor,
+        vae_model,
+        position_id: int,
+        device: torch.device
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """处理图像生成步骤"""
+        
+        # 1. 编码目标图像
+        if target_image.dim() == 3:
+            target_image = target_image.unsqueeze(0)
+        
+        with torch.no_grad():
+            target_latent = vae_model.encode(target_image.to(device))
+        
+        # 2. 处理latent为patches
+        p = self.latent_patch_size
+        latent = target_latent[0]  # 取第一个batch
+        h, w = latent.shape[1] // p, latent.shape[2] // p
+        
+        # Patchify latent
+        latent = latent[:, :h * p, :w * p].reshape(self.latent_channel, h, p, w, p)
+        latent = torch.einsum("chpwq->hwpqc", latent).reshape(-1, p * p * self.latent_channel)
+        
+        # 3. 创建位置编码和时间步
+        latent_position_ids = self.get_flattened_position_ids(
+            h * self.latent_downsample, w * self.latent_downsample,
+            self.latent_downsample,
+            max_num_patches_per_side=self.max_latent_size
+        ).to(device)
+        
+        # 使用训练时间步（这里用0表示clean image）
+        timesteps = torch.zeros(latent.shape[0], device=device)
+        
+        # 4. 处理当前序列以预测图像
+        seq_len = current_sequence.size(0)
+        position_ids = torch.full((seq_len,), position_id, device=device)
+        
+        # 前向传播
+        output = self.language_model(
+            packed_sequence=current_sequence.unsqueeze(0),
+            sample_lens=[seq_len],
+            attention_mask=None,
+            packed_position_ids=position_ids,
+        )
+        
+        # 5. 预测latent tokens
+        # 创建噪声latent作为起点
+        noise = torch.randn_like(latent)
+        timesteps_processed = torch.sigmoid(timesteps)
+        timesteps_processed = self.timestep_shift * timesteps_processed / (1 + (self.timestep_shift - 1) * timesteps_processed)
+        
+        # 构建输入latent
+        input_latent = (1 - timesteps_processed[:, None]) * latent + timesteps_processed[:, None] * noise
+        
+        # 编码latent
+        timestep_embeds = self.time_embedder(timesteps)
+        pos_embeds = self.latent_pos_embed(latent_position_ids)
+        latent_embeddings = self.vae2llm(input_latent) + timestep_embeds + pos_embeds
+        
+        # 6. 将latent embeddings添加到序列中进行预测
+        extended_sequence = torch.cat([current_sequence, latent_embeddings], dim=0)
+        extended_len = extended_sequence.size(0)
+        extended_position_ids = torch.full((extended_len,), position_id, device=device)
+        
+        # 前向传播预测
+        extended_output = self.language_model(
+            packed_sequence=extended_sequence.unsqueeze(0),
+            sample_lens=[extended_len],
+            attention_mask=None,
+            packed_position_ids=extended_position_ids,
+        )
+        
+        # 7. 计算图像损失
+        pred_latent = self.llm2vae(extended_output[0, -latent.shape[0]:, :])  # 最后N个位置的预测
+        target_velocity = noise - latent  # flow matching target
+        
+        # 只对有效时间步计算损失
+        has_mse = timesteps > 0
+        if has_mse.any():
+            image_loss = ((pred_latent - target_velocity)[has_mse] ** 2).mean()
+        else:
+            # 对于clean image (timestep=0), 直接预测latent
+            image_loss = ((pred_latent - latent) ** 2).mean()
+        
+        # 8. 更新序列（使用预测的latent）
+        updated_sequence = torch.cat([current_sequence, latent_embeddings], dim=0)
+        
+        return image_loss, updated_sequence
+
 
     def prepare_prompts(self, curr_kvlens, curr_rope, prompts, tokenizer, new_token_ids):
         packed_text_ids = list()

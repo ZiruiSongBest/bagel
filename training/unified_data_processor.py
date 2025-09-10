@@ -175,42 +175,50 @@ class UnifiedGenerationDataset(Dataset):
                     image_objects.append(placeholder_img)
                     print(f"  使用占位图像替代")
             
-            # 注释掉这个检查，因为我们现在使用占位图像
-            # if not image_objects:
-            #     print("警告: 没有有效的图像文件")
-            #     return None
-            
             # 解析对话内容
             input_sequence = []
             target_sequence = []
             input_types = []
             target_types = []
             
-            image_counter = 0
+            # 修复图像映射逻辑：
+            # images[0] (first_image) 对应用户输入的text
+            # images[1:] 对应助手回答中的<image>标记
             
             for message in messages:
                 role = message.get('role', '')
                 content = message.get('content', '')
                 
                 if role == 'user':
-                    # 用户输入，通常是文本
+                    # 用户输入包含文本和对应的第一张图像（作为上下文）
                     input_sequence.append(content)
                     input_types.append('text')
                     
+                    # 添加对应的first_image作为输入上下文
+                    if len(image_objects) > 0:
+                        input_sequence.append(image_objects[0])  # first_frame作为输入
+                        input_types.append('image')
+                    
                 elif role == 'assistant':
                     # 助手输出，可能包含文本和<image>标记
-                    # 需要解析内容中的<image>标记并替换为实际图像
+                    # <image>标记对应images[1:]（middle_frame, last_frame等）
+                    assistant_images = image_objects[1:] if len(image_objects) > 1 else []
+                    
                     parsed_content = self._parse_content_with_image_tags(
-                        content, image_objects, image_counter
+                        content, assistant_images, 0  # 从0开始计数assistant的图像
                     )
                     
                     for item_content, item_type in parsed_content:
                         target_sequence.append(item_content)
                         target_types.append(item_type)
-                        if item_type == 'image':
-                            image_counter += 1
             
             if input_sequence and target_sequence:
+                # 添加调试信息验证图像映射
+                print(f"数据解析结果:")
+                print(f"  输入序列长度: {len(input_sequence)}, 类型: {input_types}")
+                print(f"  目标序列长度: {len(target_sequence)}, 类型: {target_types}")
+                print(f"  图像文件: {[os.path.basename(img) for img in images]}")
+                
                 return UnifiedTrainingExample(
                     input_sequence=input_sequence,
                     target_sequence=target_sequence,
@@ -455,6 +463,7 @@ class UnifiedGenerationDataset(Dataset):
                 )
                 
                 # VIT数据（用于理解）
+                vit_num_tokens = 0
                 if image_data['vit_tokens'] is not None:
                     vit_start_idx = current_index + 1  # +1 for start_of_image token
                     packed_vit_tokens.append(image_data['vit_tokens'])
@@ -463,9 +472,12 @@ class UnifiedGenerationDataset(Dataset):
                         range(vit_start_idx, vit_start_idx + vit_num_tokens)
                     )
                     packed_vit_position_ids.append(image_data['vit_position_ids'])
-                    vit_token_seqlens.append(vit_num_tokens)
+                
+                # 始终添加到 vit_token_seqlens，即使没有VIT数据也添加0
+                vit_token_seqlens.append(vit_num_tokens)
                 
                 # VAE数据（用于生成）
+                vae_num_tokens = 0
                 if image_data['vae_image'] is not None:
                     vae_start_idx = current_index + 1  # +1 for start_of_image token
                     packed_vae_images.append(image_data['vae_image'])
@@ -479,11 +491,11 @@ class UnifiedGenerationDataset(Dataset):
                 # 文本tokens (start_of_image + end_of_image)
                 # 修正索引：start_of_image在开始，end_of_image在所有图像tokens之后
                 start_of_image_idx = current_index
-                end_of_image_idx = current_index + 1 + vit_num_tokens + (vae_num_tokens if image_data['vae_image'] is not None else 0)
+                end_of_image_idx = current_index + 1 + vit_num_tokens + vae_num_tokens
                 
                 packed_text_ids.extend(image_data['text_ids'])
                 packed_text_indexes.extend([start_of_image_idx, end_of_image_idx])
-                packed_position_ids.extend([current_position] * (2 + vit_num_tokens + (vae_num_tokens if image_data['vae_image'] is not None else 0)))
+                packed_position_ids.extend([current_position] * (2 + vit_num_tokens + vae_num_tokens))
                 
                 current_index += image_data['total_tokens']
                 current_position += 1
