@@ -20,9 +20,13 @@ from PIL import Image
 import numpy as np
 from torch.utils.data import Dataset, DataLoader
 from dataclasses import dataclass
+import logging
 
 from data.data_utils import pil_img2rgb
 from data.transforms import ImageTransform
+
+# 设置logger
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -81,7 +85,8 @@ class UnifiedGenerationDataset(Dataset):
         
         # 加载训练数据
         self.examples = self._load_data(data_path)
-        print(f"加载了 {len(self.examples)} 个训练样本")
+        logger.info(f"加载了 {len(self.examples)} 个训练样本")
+        # print(f"加载了 {len(self.examples)} 个训练样本")  # 注释掉控制台输出
     
     def _load_data(self, data_path: str) -> List[UnifiedTrainingExample]:
         """加载训练数据"""
@@ -117,7 +122,8 @@ class UnifiedGenerationDataset(Dataset):
                 if example:
                     examples.append(example)
             except Exception as e:
-                print(f"解析数据项时出错: {e}")
+                logger.warning(f"解析数据项时出错: {e}")
+                # print(f"解析数据项时出错: {e}")  # 注释掉控制台输出
                 continue
         
         return examples
@@ -142,10 +148,12 @@ class UnifiedGenerationDataset(Dataset):
                 # 文本到图像格式
                 return self._parse_text2image_format(item)
             else:
-                print(f"未知的数据格式: {list(item.keys())}")
+                logger.warning(f"未知的数据格式: {list(item.keys())}")
+                # print(f"未知的数据格式: {list(item.keys())}")  # 注释掉控制台输出
                 return None
         except Exception as e:
-            print(f"解析数据项失败: {e}")
+            logger.error(f"解析数据项失败: {e}")
+            # print(f"解析数据项失败: {e}")  # 注释掉控制台输出
             return None
     
     def _parse_messages_images_format(self, item: Dict) -> Optional[UnifiedTrainingExample]:
@@ -169,11 +177,13 @@ class UnifiedGenerationDataset(Dataset):
                 if os.path.exists(img_path):
                     image_objects.append(Image.open(img_path).convert('RGB'))
                 else:
-                    print(f"警告: 图像文件不存在: {img_path}")
+                    logger.warning(f"图像文件不存在: {img_path}")
+                    # print(f"警告: 图像文件不存在: {img_path}")  # 注释掉控制台输出
                     # 为测试创建一个占位图像
                     placeholder_img = Image.new('RGB', (256, 256), color=(128, 128, 128))
                     image_objects.append(placeholder_img)
-                    print(f"  使用占位图像替代")
+                    logger.info(f"使用占位图像替代: {img_path}")
+                    # print(f"  使用占位图像替代")  # 注释掉控制台输出
             
             # 解析对话内容
             input_sequence = []
@@ -213,11 +223,15 @@ class UnifiedGenerationDataset(Dataset):
                         target_types.append(item_type)
             
             if input_sequence and target_sequence:
-                # 添加调试信息验证图像映射
-                print(f"数据解析结果:")
-                print(f"  输入序列长度: {len(input_sequence)}, 类型: {input_types}")
-                print(f"  目标序列长度: {len(target_sequence)}, 类型: {target_types}")
-                print(f"  图像文件: {[os.path.basename(img) for img in images]}")
+                # 将调试信息写入logger而不是控制台
+                logger.debug(f"数据解析结果:")
+                logger.debug(f"  输入序列长度: {len(input_sequence)}, 类型: {input_types}")
+                logger.debug(f"  目标序列长度: {len(target_sequence)}, 类型: {target_types}")
+                logger.debug(f"  图像文件: {[os.path.basename(img) for img in images]}")
+                # print(f"数据解析结果:")  # 注释掉控制台输出
+                # print(f"  输入序列长度: {len(input_sequence)}, 类型: {input_types}")
+                # print(f"  目标序列长度: {len(target_sequence)}, 类型: {target_types}")
+                # print(f"  图像文件: {[os.path.basename(img) for img in images]}")
                 
                 return UnifiedTrainingExample(
                     input_sequence=input_sequence,
@@ -228,7 +242,8 @@ class UnifiedGenerationDataset(Dataset):
                 )
             
         except Exception as e:
-            print(f"解析messages+images格式失败: {e}")
+            logger.error(f"解析messages+images格式失败: {e}")
+            # print(f"解析messages+images格式失败: {e}")  # 注释掉控制台输出
             
         return None
     
@@ -249,7 +264,8 @@ class UnifiedGenerationDataset(Dataset):
                     result.append((image_objects[image_counter], 'image'))
                     image_counter += 1
                 else:
-                    print(f"警告: 图像标记超出可用图像数量")
+                    logger.warning(f"图像标记超出可用图像数量")
+                    # print(f"警告: 图像标记超出可用图像数量")  # 注释掉控制台输出
             elif part.strip():
                 # 这是文本内容
                 result.append((part.strip(), 'text'))
@@ -525,6 +541,12 @@ class UnifiedGenerationDataset(Dataset):
                 'packed_vit_tokens': torch.cat(packed_vit_tokens, dim=0),
                 'packed_vit_token_indexes': torch.tensor(packed_vit_token_indexes, dtype=torch.long),
                 'packed_vit_position_ids': torch.cat(packed_vit_position_ids, dim=0),
+                'vit_token_seqlens': torch.tensor(vit_token_seqlens, dtype=torch.int),
+            })
+        elif vit_token_seqlens:
+            # 即使没有实际的VIT tokens，如果有序列长度信息也要添加
+            # 这种情况发生在所有图像的VIT tokens都是0时
+            result.update({
                 'vit_token_seqlens': torch.tensor(vit_token_seqlens, dtype=torch.int),
             })
         

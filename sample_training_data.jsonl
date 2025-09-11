@@ -1,0 +1,3 @@
+{"input_sequence": ["画一只橘色的小猫在花园里玩耍"], "target_sequence": ["这是一只可爱的橘色小猫，正在绿色的花园中快乐地玩耍，阳光洒在它的毛发上。", "<image>"], "input_types": ["text"], "target_types": ["text", "image"], "metadata": {"description": "文本描述+图像生成任务"}}
+{"input_sequence": ["创作一幅春天樱花盛开的美景"], "target_sequence": ["春天来了，粉色的樱花满树盛开，花瓣飘洒在微风中，美丽而浪漫。", "<image>"], "input_types": ["text"], "target_types": ["text", "image"], "metadata": {"description": "春景描述+绘画任务"}}
+{"input_sequence": ["画一个红色的苹果，要很新鲜"], "target_sequence": ["<image>"], "input_types": ["text"], "target_types": ["image"], "metadata": {"description": "简单的文本到图像任务"}}

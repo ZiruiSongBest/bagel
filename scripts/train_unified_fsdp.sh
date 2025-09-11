@@ -16,10 +16,10 @@ export master_port=${master_port:-"12345"}
 export nproc_per_node=${nproc_per_node:-8}
 
 # 模型路径配置
-export model_path=${model_path:-"hf/BAGEL-7B-MoT"}
-export llm_path=${llm_path:-"hf/Qwen2.5-0.5B-Instruct/"}
-export vae_path=${vae_path:-"flux/vae/ae.safetensors"}
-export vit_path=${vit_path:-"hf/siglip-so400m-14-980-flash-attn2-navit/"}
+# export model_path=${model_path:-"hf/BAGEL-7B-MoT"}
+export llm_path=${llm_path:-"/workspace/bagel/models/Qwen2.5-0.5B-Instruct"}
+export vae_path=${vae_path:-"/workspace/bagel/models/flux/ae.safetensors"}
+export vit_path=${vit_path:-"/workspace/bagel/models/siglip-so400m-14-980-flash-attn2-navit/"}
 
 # 数据路径配置
 export train_data_path=${train_data_path:-"data/unified_train.jsonl"}
@@ -158,7 +158,7 @@ torchrun \
   --llm_qk_norm True \
   --visual_gen True \
   --visual_und True \
-  --finetune_from_hf True \
+  --finetune_from_hf False \
   --copy_init_moe True \
   \
   --num_workers 1

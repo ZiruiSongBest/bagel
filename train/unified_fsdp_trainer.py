@@ -363,21 +363,22 @@ class UnifiedDatasetWrapper:
         self.current_step = 0
         
     def __iter__(self):
-        # 创建数据加载器
-        dataloader = DataLoader(
-            self.dataset,
-            batch_size=self.batch_size,
-            shuffle=True,
-            num_workers=0,  # 统一数据集通常比较复杂，使用单进程
-            pin_memory=True,
-            drop_last=True,
-        )
-        
-        for batch in dataloader:
-            # 将批次数据转换为兼容原训练循环的格式
-            converted_batch = self._convert_batch_format(batch)
-            yield converted_batch
-            self.current_step += 1
+        # 无限循环数据加载器，支持多epoch训练
+        while True:
+            dataloader = DataLoader(
+                self.dataset,
+                batch_size=self.batch_size,
+                shuffle=True,
+                num_workers=0,  # 统一数据集通常比较复杂，使用单进程
+                pin_memory=True,
+                drop_last=False,  # 改为False确保所有数据都被使用
+            )
+            
+            for batch in dataloader:
+                # 将批次数据转换为兼容原训练循环的格式
+                converted_batch = self._convert_batch_format(batch)
+                yield converted_batch
+                self.current_step += 1
     
     def _convert_batch_format(self, batch):
         """
@@ -385,111 +386,191 @@ class UnifiedDatasetWrapper:
         """
         device = torch.cuda.current_device()
         
+        # 由于DataLoader可能添加了batch维度，我们需要移除它
+        # 因为每个样本已经是完整的打包序列
+        def remove_batch_dim(tensor_or_list):
+            if isinstance(tensor_or_list, torch.Tensor):
+                if tensor_or_list.dim() > 1:
+                    return tensor_or_list.squeeze(0)  # 移除第一个维度
+                return tensor_or_list
+            elif isinstance(tensor_or_list, list) and len(tensor_or_list) == 1:
+                return tensor_or_list[0]  # 如果是包含一个元素的列表，返回该元素
+            return tensor_or_list
+        
         # UnifiedGenerationDataset的输出格式处理
         # 将packed_text_ids映射为input_ids和labels
         packed_text_ids = batch.get('packed_text_ids')
         if packed_text_ids is None:
             raise ValueError("batch中缺少 'packed_text_ids' 字段")
         
+        # 移除batch维度
+        packed_text_ids = remove_batch_dim(packed_text_ids)
         input_ids = packed_text_ids.to(device)
         
-        # 处理注意力掩码
-        seq_len = input_ids.shape[0]
+        # 获取真实的序列长度（来自数据集）
+        real_seq_len = remove_batch_dim(batch.get('sequence_length', input_ids.shape[0]))
+        if isinstance(real_seq_len, torch.Tensor):
+            real_seq_len = real_seq_len.item()  # 转换为标量
+        text_seq_len = input_ids.shape[0]  # 文本tokens的数量
         
+        # 调试信息
+        if dist.get_rank() == 0:
+            print(f"Debug: real_seq_len={real_seq_len}, text_seq_len={text_seq_len}")
+            if 'packed_text_indexes' in batch:
+                text_indexes = remove_batch_dim(batch['packed_text_indexes'])
+                # print(f"Debug: text_indexes range=[{text_indexes.min()}, {text_indexes.max()}]")
+                # print(f"Debug: text_indexes shape={text_indexes.shape}")
+        
+        # 处理注意力掩码
         if 'nested_attention_masks' in batch and batch['nested_attention_masks']:
             # 使用数据集提供的注意力掩码
-            attention_mask = batch['nested_attention_masks'][0].to(device)
+            nested_masks = remove_batch_dim(batch['nested_attention_masks'])
+            if isinstance(nested_masks, list):
+                attention_mask = nested_masks[0].to(device)
+            else:
+                attention_mask = nested_masks.to(device)
         else:
-            # 创建默认的因果注意力掩码
-            attention_mask = torch.tril(torch.ones(seq_len, seq_len, device=device))
+            # 创建默认的因果注意力掩码（基于真实序列长度）
+            attention_mask = torch.tril(torch.ones(real_seq_len, real_seq_len, device=device))
         
         # 标签与input_ids相同，但可能需要移位
         labels = input_ids.clone()
         
-        # 使用损失掩码来控制哪些位置计算损失
-        text_loss_mask = batch.get('text_loss_mask')
-        image_loss_mask = batch.get('image_loss_mask')
-        
-        # 在不需要计算损失的位置设置labels为-100
-        # 暂时跳过损失掩码，因为大小不匹配
-        # TODO: 修复损失掩码的计算逻辑
-        pass
+        # 验证索引的有效性
+        if 'packed_text_indexes' in batch:
+            text_indexes = remove_batch_dim(batch['packed_text_indexes'])
+            if text_indexes.max() >= real_seq_len:
+                print(f"Error: text_indexes超出范围! max_index={text_indexes.max()}, seq_len={real_seq_len}")
+                # 过滤掉无效的索引
+                valid_mask = text_indexes < real_seq_len
+                if torch.any(valid_mask):
+                    valid_text_indexes = text_indexes[valid_mask]
+                    valid_text_ids = input_ids[valid_mask]
+                    print(f"Warning: 过滤后的文本tokens: {len(valid_text_ids)}/{len(input_ids)}")
+                    
+                    # 更新input_ids和indexes
+                    input_ids = valid_text_ids
+                    labels = input_ids.clone()
+                    # 使用过滤后的索引更新batch
+                    batch['packed_text_indexes'] = valid_text_indexes
+                else:
+                    print(f"Error: 所有text_indexes都无效，无法继续处理")
+                    raise ValueError("所有文本索引都超出序列范围")
         
         # 构建兼容Bagel模型的数据字典
         data_dict = {
-            'sequence_length': seq_len,
+            'sequence_length': real_seq_len,
             'packed_text_ids': input_ids,
-            'packed_text_indexes': batch.get('packed_text_indexes', torch.arange(seq_len, device=device)),
-            'packed_position_ids': batch.get('packed_position_ids', torch.arange(seq_len, device=device)),
-            'sample_lens': batch.get('sample_lens', [seq_len]),
-            'split_lens': batch.get('split_lens', [seq_len]),
-            'attn_modes': batch.get('attn_modes', ['causal']),
-            'nested_attention_masks': batch.get('nested_attention_masks', [attention_mask]),
+            'packed_text_indexes': remove_batch_dim(batch.get('packed_text_indexes', torch.arange(text_seq_len, device=device))),
+            'packed_position_ids': remove_batch_dim(batch.get('packed_position_ids', torch.arange(text_seq_len, device=device))),
+            'sample_lens': remove_batch_dim(batch.get('sample_lens', [real_seq_len])),
+            'split_lens': remove_batch_dim(batch.get('split_lens', [real_seq_len])),
+            'attn_modes': remove_batch_dim(batch.get('attn_modes', ['causal'])),
+            'nested_attention_masks': [attention_mask],
             'packed_label_ids': labels,  # 用于计算文本损失
         }
         
         # 如果有VIT图像数据
-        if 'packed_vit_tokens' in batch:
-            data_dict.update({
-                'packed_vit_tokens': batch['packed_vit_tokens'].to(device),
-                'packed_vit_token_indexes': batch['packed_vit_token_indexes'].to(device),
-                'packed_vit_position_ids': batch['packed_vit_position_ids'].to(device),
-                'vit_token_seqlens': batch['vit_token_seqlens'].to(device),
-            })
+        if 'packed_vit_tokens' in batch and 'vit_token_seqlens' in batch:
+            # 检查vit_token_seqlens是否为空或包含无效值
+            vit_seqlens = remove_batch_dim(batch['vit_token_seqlens'])
+            if len(vit_seqlens) > 0 and torch.all(vit_seqlens >= 0):
+                # 验证VIT索引的有效性
+                vit_indexes = remove_batch_dim(batch['packed_vit_token_indexes'])
+                if vit_indexes.max() >= real_seq_len:
+                    print(f"Warning: VIT索引超出范围! max_index={vit_indexes.max()}, seq_len={real_seq_len}")
+                    # 过滤掉无效的索引
+                    valid_vit_mask = vit_indexes < real_seq_len
+                    if torch.any(valid_vit_mask):
+                        valid_vit_indexes = vit_indexes[valid_vit_mask]
+                        valid_vit_tokens = remove_batch_dim(batch['packed_vit_tokens'])[valid_vit_mask]
+                        valid_vit_positions = remove_batch_dim(batch['packed_vit_position_ids'])[valid_vit_mask]
+                        
+                        data_dict.update({
+                            'packed_vit_tokens': valid_vit_tokens.to(device),
+                            'packed_vit_token_indexes': valid_vit_indexes.to(device),
+                            'packed_vit_position_ids': valid_vit_positions.to(device),
+                            'vit_token_seqlens': vit_seqlens.to(device),
+                        })
+                    else:
+                        print(f"Warning: 所有VIT索引都无效，跳过VIT处理")
+                else:
+                    data_dict.update({
+                        'packed_vit_tokens': remove_batch_dim(batch['packed_vit_tokens']).to(device),
+                        'packed_vit_token_indexes': vit_indexes.to(device),
+                        'packed_vit_position_ids': remove_batch_dim(batch['packed_vit_position_ids']).to(device),
+                        'vit_token_seqlens': vit_seqlens.to(device),
+                    })
+            else:
+                # VIT数据无效，跳过VIT相关字段
+                if dist.get_rank() == 0:
+                    print(f"Warning: Invalid or empty vit_token_seqlens: {vit_seqlens}")
+        elif 'packed_vit_tokens' in batch:
+            # 有VIT tokens但没有seqlens，这是数据不一致的情况
+            if dist.get_rank() == 0:
+                print("Warning: Found packed_vit_tokens but missing vit_token_seqlens")
         
         # 如果有VAE图像数据
         if 'padded_vae_images' in batch:
-            # 修复图像张量形状：从[1, 3, 3, H, W]变为[3, 3, H, W]
-            padded_images = batch['padded_vae_images']
-            if padded_images.dim() == 5:
-                # 移除第一个维度（batch维度），因为我们已经在外层添加了batch维度
-                padded_images = padded_images.squeeze(0)
+            # 修复图像张量形状：移除batch维度
+            padded_images = remove_batch_dim(batch['padded_vae_images'])
+            
+            vae_token_indexes = remove_batch_dim(batch['packed_vae_token_indexes'])
+            vae_position_ids = remove_batch_dim(batch['packed_vae_position_ids'])
+            vae_latent_shapes = remove_batch_dim(batch['patchified_vae_latent_shapes'])
             
             data_dict.update({
                 'padded_images': padded_images.to(device),  # 这个将在main中转换为padded_latent
-                'packed_vae_token_indexes': batch['packed_vae_token_indexes'].to(device),
-                'packed_latent_position_ids': batch['packed_vae_position_ids'].to(device), 
-                'patchified_vae_latent_shapes': batch['patchified_vae_latent_shapes'],
-                'packed_timesteps': batch.get('packed_timesteps', torch.zeros(len(batch['packed_vae_token_indexes']), device=device)),
+                'packed_vae_token_indexes': vae_token_indexes.to(device),
+                'packed_latent_position_ids': vae_position_ids.to(device), 
+                'patchified_vae_latent_shapes': vae_latent_shapes,
+                'packed_timesteps': remove_batch_dim(batch.get('packed_timesteps', torch.zeros(len(vae_token_indexes), device=device))),
             })
         
         if 'image_attention_mask' in batch:
-            data_dict['image_attention_mask'] = batch['image_attention_mask'].to(device)
+            data_dict['image_attention_mask'] = remove_batch_dim(batch['image_attention_mask']).to(device)
         
         # 添加损失计算需要的索引信息
         if 'ce_loss_indexes' in batch:
-            data_dict['ce_loss_indexes'] = batch['ce_loss_indexes'].to(device)
+            data_dict['ce_loss_indexes'] = remove_batch_dim(batch['ce_loss_indexes']).to(device)
         else:
-            # 创建文本损失索引：对所有非-100的标签计算损失
-            ce_mask = (labels != -100)
+            # 创建文本损失索引：基于文本在整个序列中的位置
+            ce_mask = torch.zeros(real_seq_len, dtype=torch.bool, device=device)
+            if 'packed_text_indexes' in data_dict:
+                # 获取文本token的位置索引
+                text_positions = data_dict['packed_text_indexes']
+                # 确保索引在有效范围内
+                valid_text_positions = text_positions[text_positions < real_seq_len]
+                if len(valid_text_positions) > 0:
+                    ce_mask[valid_text_positions] = True
             data_dict['ce_loss_indexes'] = ce_mask
         
         if 'mse_loss_indexes' in batch:
-            data_dict['mse_loss_indexes'] = batch['mse_loss_indexes'].to(device)
+            data_dict['mse_loss_indexes'] = remove_batch_dim(batch['mse_loss_indexes']).to(device)
         elif 'packed_vae_token_indexes' in batch:
             # 创建图像损失索引：对VAE token位置计算MSE损失
-            vae_indexes = batch['packed_vae_token_indexes']
+            vae_indexes = remove_batch_dim(batch['packed_vae_token_indexes'])
             
             # 调试信息：检查索引范围
             if dist.get_rank() == 0:
-                print(f"Debug: seq_len={seq_len}, vae_indexes.max()={vae_indexes.max()}, vae_indexes.min()={vae_indexes.min()}")
-                print(f"Debug: vae_indexes shape={vae_indexes.shape}, seq_len={seq_len}")
-            
+                # print(f"Debug: real_seq_len={real_seq_len}, vae_indexes.max()={vae_indexes.max()}, vae_indexes.min()={vae_indexes.min()}")
+                # print(f"Debug: vae_indexes shape={vae_indexes.shape}, real_seq_len={real_seq_len}")
+                pass
             # 确保VAE索引不超出序列长度
-            valid_vae_indexes = vae_indexes[vae_indexes < seq_len]
+            valid_vae_indexes = vae_indexes[vae_indexes < real_seq_len]
             if len(valid_vae_indexes) < len(vae_indexes):
                 print(f"Warning: Some VAE indexes ({len(vae_indexes) - len(valid_vae_indexes)}) exceed sequence length")
             
-            mse_mask = torch.zeros(seq_len, dtype=torch.bool, device=device)
+            mse_mask = torch.zeros(real_seq_len, dtype=torch.bool, device=device)
             if len(valid_vae_indexes) > 0:
                 mse_mask[valid_vae_indexes] = True
             data_dict['mse_loss_indexes'] = mse_mask
         else:
             # 没有图像数据时，设置为全False的mask
-            data_dict['mse_loss_indexes'] = torch.zeros(seq_len, dtype=torch.bool, device=device)
+            data_dict['mse_loss_indexes'] = torch.zeros(real_seq_len, dtype=torch.bool, device=device)
         
         # 修复 sample_lens - 使用数据集提供的值
-        data_dict['sample_lens'] = batch.get('sample_lens', [seq_len])
+        data_dict['sample_lens'] = batch.get('sample_lens', [real_seq_len])
         
         # 添加虚拟的数据索引信息（用于检查点恢复）
         data_dict['batch_data_indexes'] = [{
@@ -567,7 +648,16 @@ def main():
     assert torch.cuda.is_available()
     # 设置分布式训练超时时间
     dist.init_process_group("nccl", timeout=timedelta(minutes=30))
-    device = dist.get_rank() % torch.cuda.device_count()
+    
+    # 获取本地rank，确保每个进程使用不同的GPU
+    local_rank = int(os.environ.get("LOCAL_RANK", dist.get_rank()))
+    device = local_rank % torch.cuda.device_count()
+    
+    # 添加同步，确保所有进程准备就绪
+    dist.barrier()
+    
+    # 清理CUDA缓存并设置设备
+    torch.cuda.empty_cache()
     torch.cuda.set_device(device)
     parser = HfArgumentParser((ModelArguments, UnifiedDataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()

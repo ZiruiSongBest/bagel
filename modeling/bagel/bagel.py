@@ -163,20 +163,41 @@ class Bagel(PreTrainedModel):
         else:
             attention_mask = nested_attention_masks
 
-        if self.config.visual_und:
-            cu_seqlens = torch.nn.functional.pad(torch.cumsum(vit_token_seqlens, dim=0), (1, 0))
-            cu_seqlens = cu_seqlens.to(torch.int32)
-            max_seqlen = torch.max(vit_token_seqlens).item()
-            packed_vit_token_embed = self.vit_model(
-                packed_pixel_values=packed_vit_tokens, 
-                packed_flattened_position_ids=packed_vit_position_ids,
-                cu_seqlens=cu_seqlens,
-                max_seqlen=max_seqlen,
-            )
-            packed_vit_token_embed = self.connector(packed_vit_token_embed)
-            vit_token_pos_emb = self.vit_pos_embed(packed_vit_position_ids)
-            packed_vit_token_embed = packed_vit_token_embed + vit_token_pos_emb
-            packed_sequence[packed_vit_token_indexes] = packed_vit_token_embed
+        if self.config.visual_und and vit_token_seqlens is not None:
+            # 数据完整性检查
+            if len(vit_token_seqlens) == 0:
+                # 如果没有VIT数据，跳过VIT处理
+                pass
+            else:
+                # 检查是否有负数或异常值
+                if torch.any(vit_token_seqlens < 0):
+                    print(f"错误：vit_token_seqlens包含负数: {vit_token_seqlens}")
+                    print(f"形状: {vit_token_seqlens.shape}, 数据类型: {vit_token_seqlens.dtype}")
+                    raise ValueError(f"vit_token_seqlens包含无效的负数值")
+                
+                # 检查是否所有值都是0（没有实际的VIT数据）
+                if torch.all(vit_token_seqlens == 0):
+                    # 所有图像都没有VIT数据，跳过VIT处理
+                    pass
+                else:
+                    max_val = torch.max(vit_token_seqlens).item()
+                    if max_val > 10000:  # 设置一个合理的上限，防止内存溢出
+                        print(f"警告：vit_token_seqlens包含异常大的值: {max_val}")
+                        print(f"完整张量: {vit_token_seqlens}")
+                    
+                    cu_seqlens = torch.nn.functional.pad(torch.cumsum(vit_token_seqlens, dim=0), (1, 0))
+                    cu_seqlens = cu_seqlens.to(torch.int32)
+                    max_seqlen = torch.max(vit_token_seqlens).item()
+                    packed_vit_token_embed = self.vit_model(
+                        packed_pixel_values=packed_vit_tokens, 
+                        packed_flattened_position_ids=packed_vit_position_ids,
+                        cu_seqlens=cu_seqlens,
+                        max_seqlen=max_seqlen,
+                    )
+                    packed_vit_token_embed = self.connector(packed_vit_token_embed)
+                    vit_token_pos_emb = self.vit_pos_embed(packed_vit_position_ids)
+                    packed_vit_token_embed = packed_vit_token_embed + vit_token_pos_emb
+                    packed_sequence[packed_vit_token_indexes] = packed_vit_token_embed
 
         if self.config.visual_gen:
             p = self.latent_patch_size
@@ -642,13 +663,16 @@ class Bagel(PreTrainedModel):
             new_rope.append(curr_position_id + len(text_ids))
             curr += len(text_ids)
 
+        # 获取模型所在的设备
+        device = next(self.parameters()).device
+        
         generation_input = {
-            "text_token_lens": torch.tensor(text_token_lens, dtype=torch.int),
-            "packed_text_ids": torch.tensor(packed_text_ids, dtype=torch.long),
-            "packed_text_position_ids": torch.tensor(packed_text_position_ids, dtype=torch.long),
-            "packed_text_indexes": torch.tensor(packed_text_indexes, dtype=torch.long),
-            "packed_key_value_indexes": torch.tensor(packed_key_value_indexes, dtype=torch.long),
-            "key_values_lens": torch.tensor(curr_kvlens, dtype=torch.int),
+            "text_token_lens": torch.tensor(text_token_lens, dtype=torch.int, device=device),
+            "packed_text_ids": torch.tensor(packed_text_ids, dtype=torch.long, device=device),
+            "packed_text_position_ids": torch.tensor(packed_text_position_ids, dtype=torch.long, device=device),
+            "packed_text_indexes": torch.tensor(packed_text_indexes, dtype=torch.long, device=device),
+            "packed_key_value_indexes": torch.tensor(packed_key_value_indexes, dtype=torch.long, device=device),
+            "key_values_lens": torch.tensor(curr_kvlens, dtype=torch.int, device=device),
         }
 
         return generation_input, newlens, new_rope
@@ -767,6 +791,22 @@ class Bagel(PreTrainedModel):
         packed_text_embedding = self.language_model.model.embed_tokens(packed_text_ids)
         packed_sequence = packed_text_embedding.new_zeros((sum(packed_seqlens), self.hidden_size))
         packed_sequence[packed_text_indexes] = packed_text_embedding
+
+        # 数据完整性检查
+        if vit_token_seqlens is None:
+            raise ValueError("vit_token_seqlens不能为None")
+        
+        if len(vit_token_seqlens) == 0:
+            raise ValueError("vit_token_seqlens不能为空")
+        
+        # 检查是否有负数或异常值
+        min_val = torch.min(vit_token_seqlens).item()
+        max_val = torch.max(vit_token_seqlens).item()
+        
+        if min_val < 0:
+            print(f"错误：vit_token_seqlens包含负数: {vit_token_seqlens}")
+            print(f"形状: {vit_token_seqlens.shape}, 数据类型: {vit_token_seqlens.dtype}")
+            raise ValueError(f"vit_token_seqlens包含无效的负数值: {min_val}")
 
         cu_seqlens = torch.nn.functional.pad(torch.cumsum(vit_token_seqlens, dim=0), (1, 0))
         cu_seqlens = cu_seqlens.to(torch.int32)
@@ -1307,11 +1347,14 @@ class Bagel(PreTrainedModel):
             packed_query_position_ids.append(curr_position_id)
             curr += curr_kvlen
 
+        # 获取模型所在的设备
+        device = next(self.parameters()).device
+        
         generation_input = {
-            "packed_start_tokens": torch.tensor(packed_start_tokens, dtype=torch.long),
-            "packed_query_position_ids": torch.tensor(packed_query_position_ids, dtype=torch.long),
-            "key_values_lens": torch.tensor(curr_kvlens, dtype=torch.int),
-            "packed_key_value_indexes": torch.tensor(packed_key_value_indexes, dtype=torch.long),
+            "packed_start_tokens": torch.tensor(packed_start_tokens, dtype=torch.long, device=device),
+            "packed_query_position_ids": torch.tensor(packed_query_position_ids, dtype=torch.long, device=device),
+            "key_values_lens": torch.tensor(curr_kvlens, dtype=torch.int, device=device),
+            "packed_key_value_indexes": torch.tensor(packed_key_value_indexes, dtype=torch.long, device=device),
         }
 
         return generation_input
