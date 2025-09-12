@@ -645,20 +645,36 @@ def create_unified_dataset(data_args, model_args, tokenizer, new_token_ids):
 
 def main():
     """主训练函数"""
-    assert torch.cuda.is_available()
-    # 设置分布式训练超时时间
+    assert torch.cuda.is_available(), "CUDA不可用"
+    
+    # 获取本地rank，确保每个进程使用不同的GPU（在init_process_group之前）
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    device_count = torch.cuda.device_count()
+    
+    print(f"Rank {local_rank}: CUDA设备数量: {device_count}, World size: {world_size}")
+    
+    # 确保有足够的GPU
+    if device_count < world_size:
+        raise RuntimeError(f"可用GPU数量({device_count})少于进程数量({world_size})")
+    
+    device = local_rank % device_count
+    print(f"Rank {local_rank}: 使用设备 {device}")
+    
+    # 设置CUDA设备（在init_process_group之前）
+    torch.cuda.set_device(device)
+    torch.cuda.empty_cache()
+    
+    # 设置分布式训练超时时间，指定设备
     dist.init_process_group("nccl", timeout=timedelta(minutes=30))
     
-    # 获取本地rank，确保每个进程使用不同的GPU
-    local_rank = int(os.environ.get("LOCAL_RANK", dist.get_rank()))
-    device = local_rank % torch.cuda.device_count()
-    
-    # 添加同步，确保所有进程准备就绪
-    dist.barrier()
-    
-    # 清理CUDA缓存并设置设备
-    torch.cuda.empty_cache()
-    torch.cuda.set_device(device)
+    # 使用指定设备进行barrier同步
+    try:
+        dist.barrier(device_ids=[device])
+        print(f"Rank {local_rank}: barrier同步成功")
+    except Exception as e:
+        print(f"Rank {local_rank}: barrier同步失败: {e}")
+        raise
     parser = HfArgumentParser((ModelArguments, UnifiedDataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
@@ -712,13 +728,7 @@ def main():
 
     # Setup model:
     if training_args.finetune_from_hf:
-        # 尝试从model_path加载，如果不存在则从llm_path加载
-        llm_config_path = os.path.join(model_args.model_path, "llm_config.json")
-        if os.path.exists(llm_config_path):
-            llm_config = Qwen2Config.from_json_file(llm_config_path)
-        else:
-            logger.info(f"llm_config.json not found at {llm_config_path}, loading from {model_args.llm_path}")
-            llm_config = Qwen2Config.from_pretrained(model_args.llm_path)
+        llm_config = Qwen2Config.from_json_file(os.path.join(model_args.model_path, "llm_config.json"))
     else:
         llm_config = Qwen2Config.from_pretrained(model_args.llm_path)
     llm_config.layer_module = model_args.layer_module

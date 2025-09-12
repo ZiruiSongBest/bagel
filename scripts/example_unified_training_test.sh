@@ -10,7 +10,7 @@ export num_nodes=1
 export node_rank=0
 export master_addr="localhost"
 export master_port=12345
-export nproc_per_node=2  # 两个GPU
+export nproc_per_node=1  # 两个GPU
 
 # 模型和数据路径 - 请根据你的实际路径修改
 # export model_path="/workspace/bagel/models"
@@ -24,7 +24,7 @@ export train_data_path="/workspace/bagel/dataset/demo/demo_sample/anno.json"
 export val_data_path=""  # 明确设置为空字符串，表示不使用验证数据
 
 # 输出路径
-export output_path="results/unified_training_$(date +%Y%m%d_%H%M%S)"
+export output_path="results/unified_training_test$(date +%Y%m%d_%H%M%S)"
 export ckpt_path="$output_path/checkpoints"
 
 # 训练配置 - 过拟合20个样本100次
@@ -44,7 +44,7 @@ export wandb_offline="False"
 
 # FSDP配置 - 针对2个GPU优化
 export sharding_strategy="FULL_SHARD"  # 完全分片，适合多GPU训练
-export num_shard=2
+export num_shard=1
 export cpu_offload="False"
 
 # 模型配置
@@ -71,4 +71,4 @@ echo "预计checkpoint保存次数: $((total_steps / save_every))"
 echo "输出目录: $output_path"
 
 # 调用训练脚本
-bash scripts/train_unified_fsdp.sh
+bash scripts/train_unified_fsdp_test.sh
