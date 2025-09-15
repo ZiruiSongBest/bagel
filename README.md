@@ -1,4 +1,5 @@
 # inference
+'''
 python unified_image_editing_inference.py \
     --model_path /workspace/models/b-ours-v1 \
     --generation_mode edit \
@@ -11,6 +12,6 @@ User: Draw what it will look like one hour later."''
 " \
     --use_autoregressive \
     --max_length 300
-
+‘’‘
 
 
