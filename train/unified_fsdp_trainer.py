@@ -412,7 +412,23 @@ class UnifiedDatasetWrapper:
         # 移除batch维度
         packed_text_ids = remove_batch_dim(packed_text_ids)
         input_ids = packed_text_ids.to(device)
-        
+
+        # 获取对应的标签（已在数据处理阶段右移）
+        if 'packed_label_ids' in batch:
+            packed_label_ids = remove_batch_dim(batch['packed_label_ids'])
+        else:
+            raise ValueError("batch中缺少 'packed_label_ids' 字段")
+
+        # 文本损失掩码（与packed_text_ids等长，用于筛选实际需要监督的token）
+        text_token_loss_mask = batch.get('packed_text_loss_mask')
+        if text_token_loss_mask is None:
+            text_token_loss_mask = torch.ones_like(packed_label_ids, dtype=torch.bool)
+        else:
+            text_token_loss_mask = remove_batch_dim(text_token_loss_mask).bool()
+
+        if text_token_loss_mask.shape[0] != packed_label_ids.shape[0]:
+            raise ValueError("packed_text_loss_mask的长度与packed_label_ids不一致")
+
         # 获取真实的序列长度（来自数据集）
         real_seq_len = remove_batch_dim(batch.get('sequence_length', input_ids.shape[0]))
         if isinstance(real_seq_len, torch.Tensor):
@@ -439,9 +455,6 @@ class UnifiedDatasetWrapper:
             # 创建默认的因果注意力掩码（基于真实序列长度）
             attention_mask = torch.tril(torch.ones(real_seq_len, real_seq_len, device=device))
         
-        # 标签与input_ids相同，但可能需要移位
-        labels = input_ids.clone()
-        
         # 验证索引的有效性
         if 'packed_text_indexes' in batch:
             text_indexes = remove_batch_dim(batch['packed_text_indexes'])
@@ -453,27 +466,43 @@ class UnifiedDatasetWrapper:
                     valid_text_indexes = text_indexes[valid_mask]
                     valid_text_ids = input_ids[valid_mask]
                     print(f"Warning: 过滤后的文本tokens: {len(valid_text_ids)}/{len(input_ids)}")
-                    
+
                     # 更新input_ids和indexes
                     input_ids = valid_text_ids
-                    labels = input_ids.clone()
-                    # 使用过滤后的索引更新batch
                     batch['packed_text_indexes'] = valid_text_indexes
+                    packed_label_ids = packed_label_ids[valid_mask]
+                    text_token_loss_mask = text_token_loss_mask[valid_mask]
                 else:
                     print(f"Error: 所有text_indexes都无效，无法继续处理")
                     raise ValueError("所有文本索引都超出序列范围")
-        
+
+        # 文本token在完整序列中的位置
+        text_positions = remove_batch_dim(batch.get('packed_text_indexes', torch.arange(input_ids.shape[0], dtype=torch.long)))
+        text_positions = text_positions.long()
+
+        if text_positions.shape[0] != packed_label_ids.shape[0]:
+            raise ValueError("packed_text_indexes与标签长度不一致")
+
+        # 基于loss mask筛选需要监督的token
+        selected_positions = text_positions[text_token_loss_mask]
+        ce_mask_cpu = torch.zeros(real_seq_len, dtype=torch.bool)
+        if len(selected_positions) > 0:
+            valid_positions = selected_positions[selected_positions < real_seq_len]
+            ce_mask_cpu[valid_positions] = True
+
+        filtered_label_ids = packed_label_ids[text_token_loss_mask]
+
         # 构建兼容Bagel模型的数据字典
         data_dict = {
             'sequence_length': real_seq_len,
             'packed_text_ids': input_ids,
-            'packed_text_indexes': remove_batch_dim(batch.get('packed_text_indexes', torch.arange(text_seq_len, device=device))),
-            'packed_position_ids': remove_batch_dim(batch.get('packed_position_ids', torch.arange(text_seq_len, device=device))),
+            'packed_text_indexes': text_positions.to(device),
+            'packed_position_ids': remove_batch_dim(batch.get('packed_position_ids', torch.arange(text_seq_len, dtype=torch.long))).to(device),
             'sample_lens': remove_batch_dim(batch.get('sample_lens', [real_seq_len])),
             'split_lens': remove_batch_dim(batch.get('split_lens', [real_seq_len])),
             'attn_modes': remove_batch_dim(batch.get('attn_modes', ['causal'])),
             'nested_attention_masks': [attention_mask],
-            'packed_label_ids': labels,  # 用于计算文本损失
+            'packed_label_ids': filtered_label_ids.to(device),  # 用于计算文本损失
         }
         
         # 如果有VIT图像数据
@@ -540,16 +569,7 @@ class UnifiedDatasetWrapper:
         if 'ce_loss_indexes' in batch:
             data_dict['ce_loss_indexes'] = remove_batch_dim(batch['ce_loss_indexes']).to(device)
         else:
-            # 创建文本损失索引：基于文本在整个序列中的位置
-            ce_mask = torch.zeros(real_seq_len, dtype=torch.bool, device=device)
-            if 'packed_text_indexes' in data_dict:
-                # 获取文本token的位置索引
-                text_positions = data_dict['packed_text_indexes']
-                # 确保索引在有效范围内
-                valid_text_positions = text_positions[text_positions < real_seq_len]
-                if len(valid_text_positions) > 0:
-                    ce_mask[valid_text_positions] = True
-            data_dict['ce_loss_indexes'] = ce_mask
+            data_dict['ce_loss_indexes'] = ce_mask_cpu.to(device)
         
         if 'mse_loss_indexes' in batch:
             data_dict['mse_loss_indexes'] = remove_batch_dim(batch['mse_loss_indexes']).to(device)
@@ -916,9 +936,12 @@ def main():
         # 文本损失
         ce = loss_dict.get("ce")
         if ce is not None:
-            total_ce_tokens = torch.tensor(len(data.get('ce_loss_indexes', [])), device=device)
+            ce_mask = data.get('ce_loss_indexes', torch.zeros(0, device=device, dtype=torch.bool))
+            if not torch.is_tensor(ce_mask):
+                ce_mask = torch.tensor(ce_mask, device=device, dtype=torch.bool)
+            total_ce_tokens = ce_mask.long().sum()
             dist.all_reduce(total_ce_tokens, op=dist.ReduceOp.SUM)
-            if total_ce_tokens > 0:
+            if total_ce_tokens.item() > 0:
                 ce = ce.sum() * dist.get_world_size() / total_ce_tokens
                 loss_dict["ce"] = ce.detach()
                 loss = loss + ce * training_args.text_loss_weight
@@ -930,9 +953,12 @@ def main():
         if training_args.visual_gen:
             mse = loss_dict.get("mse")
             if mse is not None:
-                total_mse_tokens = torch.tensor(len(data.get('mse_loss_indexes', [])), device=device)
+                mse_mask = data.get('mse_loss_indexes', torch.zeros(0, device=device, dtype=torch.bool))
+                if not torch.is_tensor(mse_mask):
+                    mse_mask = torch.tensor(mse_mask, device=device, dtype=torch.bool)
+                total_mse_tokens = mse_mask.long().sum()
                 dist.all_reduce(total_mse_tokens, op=dist.ReduceOp.SUM)
-                if total_mse_tokens > 0:
+                if total_mse_tokens.item() > 0:
                     mse = mse.mean(dim=-1).sum() * dist.get_world_size() / total_mse_tokens
                     loss_dict["mse"] = mse.detach()
                     loss = loss + mse * training_args.image_loss_weight
