@@ -40,6 +40,10 @@ export finetune_from_hf="True"  # 改为True，表示从已保存的BAGEL模型�
 export auto_resume="True"
 export resume_model_only="True"
 export finetune_from_ema="True"
+export ema=0.98  # 从默认的0.9999降低到0.999，提高学习速度
+export freeze_vit="True"
+export freeze_llm="False"
+export freeze_vae="True"
 
 
 # 训练超参数
@@ -52,7 +56,6 @@ export max_num_tokens=1152
 export max_num_tokens_per_sample=1024
 
 # EMA设置 - 修复过大的EMA值问题
-export ema=0.995  # 从默认的0.9999降低到0.999，提高学习速度
 
 # 其他训练配置 - 优化显存使用
 export batch_size=1
@@ -60,6 +63,9 @@ export gradient_accumulation_steps=4  # 减少梯度累积步数
 export total_steps=100000
 export warmup_steps=2000
 export save_every=2000
+
+# 内存管理配置 - 防止保存checkpoint时内存不足
+export clear_cache="True"  # 在保存checkpoint前后清理CUDA缓存
 
 # FSDP配置 - 激进显存优化
 export sharding_strategy="FULL_SHARD"  # 使用完全分片以最大化显存节省 HYBRID_SHARD

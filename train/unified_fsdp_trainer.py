@@ -343,6 +343,12 @@ class TrainingArguments:
         default=True,
         metadata={"help": "Duplicate initial MoE experts so each has identical initialisation."}
     )
+    
+    # --- 内存管理配置 ---
+    clear_cache: bool = field(
+        default=True,
+        metadata={"help": "Clear CUDA cache before saving checkpoints to prevent out of memory errors."}
+    )
 
 
 class UnifiedDatasetWrapper:
@@ -950,6 +956,10 @@ def main():
             optimizer.zero_grad()
             fsdp_ema_update(ema_model, fsdp_model, decay=training_args.ema)
             gradient_accumulation_counter = 0
+            
+            # 定期清理缓存以防止内存积累（可选，每10个梯度更新步骤）
+            if training_args.clear_cache and curr_step % (10 * training_args.gradient_accumulation_steps) == 0:
+                torch.cuda.empty_cache()
 
         # Log loss values:
         if curr_step % training_args.log_every == 0:
@@ -998,6 +1008,12 @@ def main():
                 data_status[item['dataset_name']][item['worker_id']] = item['data_indexes']
 
         if curr_step > 0 and curr_step % training_args.save_every == 0:
+            # 在保存checkpoint前清理CUDA缓存以避免内存不足错误
+            if training_args.clear_cache:
+                torch.cuda.empty_cache()
+                if dist.get_rank() == 0:
+                    logger.info("Cleared CUDA cache before saving checkpoint")
+            
             if dist.get_rank() == 0:
                 gather_list = [None] * dist.get_world_size()
             else:
@@ -1015,6 +1031,12 @@ def main():
                 fsdp_config=fsdp_config,
                 data_status=gather_list
             )
+            
+            # 保存完成后再次清理缓存
+            if training_args.clear_cache:
+                torch.cuda.empty_cache()
+                if dist.get_rank() == 0:
+                    logger.info("Cleared CUDA cache after saving checkpoint")
 
     logger.info("Done!")
     if dist.get_rank() == 0:

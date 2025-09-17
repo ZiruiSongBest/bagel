@@ -80,6 +80,9 @@ export layer_module=${layer_module:-"Qwen2MoTDecoderLayer"}
 export text_loss_weight=${text_loss_weight:-1.0}
 export image_loss_weight=${image_loss_weight:-1.0}
 
+# 内存管理配置
+export clear_cache=${clear_cache:-"True"}
+
 # ====== 启动训练 ======
 echo "====== 统一训练FSDP配置 ======"
 echo "节点数量: $num_nodes"
@@ -171,6 +174,7 @@ if [ "$is_finetune" = "True" ]; then
         --resume_model_only $resume_model_only \
         --finetune_from_ema $finetune_from_ema \
         --copy_init_moe True \
+        --clear_cache $clear_cache \
         \
         --num_workers 1
 
@@ -232,6 +236,7 @@ else
         --visual_und True \
         --finetune_from_hf $finetune_from_hf \
         --copy_init_moe True \
+        --clear_cache $clear_cache \
         \
         --num_workers 1
 
