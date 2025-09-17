@@ -8,7 +8,7 @@
 echo "====== 统一模型Fine-tuning示例 ======"
 
 # GPU设置 - 明确指定使用两张GPU
-export CUDA_VISIBLE_DEVICES=0,1,2  # 使用GPU 0和1
+export CUDA_VISIBLE_DEVICES=0,1  # 使用GPU 0和1
 
 # PyTorch内存管理优化 - 移除不支持的选项
 export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128,roundup_power2_divisions:8
@@ -24,7 +24,7 @@ export num_nodes=1
 export node_rank=0
 export master_addr="localhost"
 export master_port=12345
-export nproc_per_node=3  # 根据你的GPU数量调整
+export nproc_per_node=2  # 根据你的GPU数量调整
 
 # 模型路径配置 - 请根据你的实际路径修改
 export model_path="/workspace/models/BAGEL-7B-MoT"  # 预训练模型路径
@@ -69,9 +69,9 @@ export clear_cache="True"  # 在保存checkpoint前后清理CUDA缓存
 
 # FSDP配置 - 激进显存优化
 export sharding_strategy="FULL_SHARD"  # 使用完全分片以最大化显存节省 HYBRID_SHARD
-export num_shard=3  # 修改为实际GPU数量
+export num_shard=2  # 修改为实际GPU数量
 export num_replicate=1  # 复制数量
-export cpu_offload="False"
+export cpu_offload="True"
 
 # 输出路径
 export output_path="results/unified_finetune_$(date +%Y%m%d_%H%M%S)"
