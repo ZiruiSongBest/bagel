@@ -28,6 +28,16 @@ from data.transforms import ImageTransform
 # 设置logger
 logger = logging.getLogger(__name__)
 
+# 默认统一系统提示词，与推理阶段保持一致
+DEFAULT_SYSTEM_PROMPT = '''You are a multimodal AI that can generate both text and images. When generating content:
+
+1. For text: Simply generate text naturally
+2. For images: Use the special tokens <|vision_start|> and <|vision_end|> to mark where an image should be generated
+
+- Mixed response: "I'll create an image for you: <|vision_start|> <|vision_end|> And here's some additional text."
+
+Always use <|vision_start|> and <|vision_end|> tokens when you want to generate an image.'''
+
 
 @dataclass
 class UnifiedTrainingExample:
@@ -58,6 +68,7 @@ class UnifiedGenerationDataset(Dataset):
         image_generation_prob: float = 0.5,
         text_generation_prob: float = 0.5,
         multimodal_prob: float = 0.3,
+        system_prompt: Optional[str] = DEFAULT_SYSTEM_PROMPT,
     ):
         """
         Args:
@@ -82,11 +93,15 @@ class UnifiedGenerationDataset(Dataset):
         self.image_generation_prob = image_generation_prob
         self.text_generation_prob = text_generation_prob
         self.multimodal_prob = multimodal_prob
+        self.system_prompt = system_prompt
         
         # 加载训练数据
         self.examples = self._load_data(data_path)
         logger.info(f"加载了 {len(self.examples)} 个训练样本")
         # print(f"加载了 {len(self.examples)} 个训练样本")  # 注释掉控制台输出
+
+        # 只提示一次：当目标图像之前缺乏可监督token时，用于调试<|vision_start|>
+        self._warned_start_without_context = False
     
     def _load_data(self, data_path: str) -> List[UnifiedTrainingExample]:
         """加载训练数据"""
@@ -190,6 +205,10 @@ class UnifiedGenerationDataset(Dataset):
             target_sequence = []
             input_types = []
             target_types = []
+
+            if self.system_prompt:
+                input_sequence.append(self.system_prompt)
+                input_types.append('text')
             
             # 修复图像映射逻辑：
             # images[0] (first_image) 对应用户输入的text
@@ -215,7 +234,10 @@ class UnifiedGenerationDataset(Dataset):
                     assistant_images = image_objects[1:] if len(image_objects) > 1 else []
                     
                     parsed_content = self._parse_content_with_image_tags(
-                        content, assistant_images, 0  # 从0开始计数assistant的图像
+                        content,
+                        assistant_images,
+                        0,  # 从0开始计数assistant的图像
+                        wrap_with_role=True,
                     )
                     
                     for item_content, item_type in parsed_content:
@@ -247,17 +269,30 @@ class UnifiedGenerationDataset(Dataset):
             
         return None
     
-    def _parse_content_with_image_tags(self, content: str, image_objects: List[Image.Image], start_counter: int):
+    def _parse_content_with_image_tags(
+        self,
+        content: str,
+        image_objects: List[Image.Image],
+        start_counter: int,
+        wrap_with_role: bool = False,
+    ):
         """解析包含<image>标记的内容"""
         import re
-        
+
         # 分割文本，找到<image>标记的位置
         parts = re.split(r'(<image>)', content)
-        
+
         result = []
         image_counter = start_counter
-        
-        for part in parts:
+
+        text_indices = [
+            idx for idx, part in enumerate(parts)
+            if part != '<image>' and part.strip()
+        ]
+        first_text_idx = text_indices[0] if text_indices else None
+        last_text_idx = text_indices[-1] if text_indices else None
+
+        for idx, part in enumerate(parts):
             if part == '<image>':
                 # 这是一个图像标记，替换为实际图像
                 if image_counter < len(image_objects):
@@ -268,8 +303,17 @@ class UnifiedGenerationDataset(Dataset):
                     # print(f"警告: 图像标记超出可用图像数量")  # 注释掉控制台输出
             elif part.strip():
                 # 这是文本内容
-                result.append((part.strip(), 'text'))
-        
+                stripped = part.strip()
+                if wrap_with_role and first_text_idx is not None:
+                    if idx == first_text_idx:
+                        stripped = 'role": "assistant", "content": "{}'.format(stripped)
+                    if idx == last_text_idx:
+                        stripped = f'{stripped}"'
+                result.append((stripped, 'text'))
+
+        if wrap_with_role and not text_indices:
+            result.insert(0, ('role": "assistant", "content": ""', 'text'))
+
         return result
     
     def _parse_conversation_format(self, item: Dict) -> Optional[UnifiedTrainingExample]:
@@ -448,9 +492,12 @@ class UnifiedGenerationDataset(Dataset):
         vit_token_seqlens = []
         packed_vae_images = []
         packed_vae_token_indexes = []
+        target_vae_token_indexes = []
         packed_vae_position_ids = []
         patchified_vae_latent_shapes = []
         packed_position_ids = []
+
+        target_image_start_token_positions = []
         
         current_index = 0
         current_position = 0
@@ -496,28 +543,65 @@ class UnifiedGenerationDataset(Dataset):
                     vae_start_idx = current_index + 1  # +1 for start_of_image token
                     packed_vae_images.append(image_data['vae_image'])
                     vae_num_tokens = image_data['vae_num_tokens']
-                    packed_vae_token_indexes.extend(
-                        range(vae_start_idx + vit_num_tokens, vae_start_idx + vit_num_tokens + vae_num_tokens)
+                    vae_token_range = range(
+                        vae_start_idx + vit_num_tokens,
+                        vae_start_idx + vit_num_tokens + vae_num_tokens,
                     )
+                    packed_vae_token_indexes.extend(vae_token_range)
                     packed_vae_position_ids.append(image_data['vae_position_ids'])
                     patchified_vae_latent_shapes.append(image_data['vae_latent_shape'])
+                    if is_target:
+                        target_vae_token_indexes.extend(vae_token_range)
                 
                 # 文本tokens (start_of_image + end_of_image)
                 # 修正索引：start_of_image在开始，end_of_image在所有图像tokens之后
                 start_of_image_idx = current_index
                 end_of_image_idx = current_index + 1 + vit_num_tokens + vae_num_tokens
-                
+
+                start_token_list_idx = len(packed_text_ids)
+
                 packed_text_ids.extend(image_data['text_ids'])
                 packed_text_indexes.extend([start_of_image_idx, end_of_image_idx])
                 packed_position_ids.extend([current_position] * (2 + vit_num_tokens + vae_num_tokens))
                 packed_label_ids.extend(image_data['label_ids'])
                 packed_text_loss_mask.extend(image_data['loss_mask'])
-                
+
+                if is_target:
+                    target_image_start_token_positions.append(start_token_list_idx)
+
                 current_index += image_data['total_tokens']
                 current_position += 1
         
         # 创建简单的因果注意力掩码
         from data.data_utils import prepare_attention_mask_per_sample
+
+        if target_image_start_token_positions:
+            start_token_id = self.new_token_ids['start_of_image']
+            disallowed_prev_ids = {
+                self.new_token_ids['start_of_image'],
+                self.new_token_ids['end_of_image'],
+            }
+            for start_position in target_image_start_token_positions:
+                prev_idx = start_position - 1
+                while prev_idx >= 0:
+                    if not packed_text_loss_mask[prev_idx]:
+                        prev_idx -= 1
+                        continue
+                    if packed_text_ids[prev_idx] in disallowed_prev_ids:
+                        prev_idx -= 1
+                        continue
+                    break
+
+                if prev_idx >= 0:
+                    packed_label_ids[prev_idx] = start_token_id
+                    packed_text_loss_mask[start_position] = False
+                else:
+                    if not self._warned_start_without_context:
+                        logger.warning(
+                            "目标图像前缺少可监督token，<|vision_start|>仍将在其自身位置上计算损失。"
+                        )
+                        self._warned_start_without_context = True
+
         nested_attention_mask = prepare_attention_mask_per_sample(
             [current_index], ['causal'], 'cpu'
         )
@@ -531,9 +615,16 @@ class UnifiedGenerationDataset(Dataset):
                 text_loss_mask[text_indexes_tensor[loss_mask_tensor]] = True
 
         image_loss_mask = torch.zeros(current_index, dtype=torch.bool)
-        if packed_vae_token_indexes:
-            image_indexes_tensor = torch.tensor(packed_vae_token_indexes, dtype=torch.long)
+        if target_vae_token_indexes:
+            image_indexes_tensor = torch.tensor(target_vae_token_indexes, dtype=torch.long)
             image_loss_mask[image_indexes_tensor] = True
+
+        # 构建packed_timesteps：仅对目标图像token保留非负timestep，其余设置为-Inf
+        packed_timesteps = torch.tensor([], dtype=torch.float32)
+        if packed_vae_token_indexes:
+            target_index_set = set(target_vae_token_indexes)
+            timestep_list = [0.0 if idx in target_index_set else float('-inf') for idx in packed_vae_token_indexes]
+            packed_timesteps = torch.tensor(timestep_list, dtype=torch.float32)
 
         # 构建最终数据
         result = {
@@ -545,6 +636,7 @@ class UnifiedGenerationDataset(Dataset):
             'packed_text_loss_mask': torch.tensor(packed_text_loss_mask, dtype=torch.bool),
             'text_loss_mask': text_loss_mask,
             'image_loss_mask': image_loss_mask,
+            'mse_loss_indexes': image_loss_mask,
             # 添加注意力掩码相关参数
             'sample_lens': [current_index],  # 当前样本的总长度
             'split_lens': [current_index],   # 将整个序列作为一个split  
@@ -582,7 +674,7 @@ class UnifiedGenerationDataset(Dataset):
                 'packed_vae_token_indexes': torch.tensor(packed_vae_token_indexes, dtype=torch.long),
                 'packed_vae_position_ids': torch.cat(packed_vae_position_ids, dim=0),
                 'patchified_vae_latent_shapes': patchified_vae_latent_shapes,
-                'packed_timesteps': torch.tensor([0.0] * len(packed_vae_token_indexes)),  # 训练时使用clean images
+                'packed_timesteps': packed_timesteps if packed_timesteps.numel() > 0 else torch.tensor([], dtype=torch.float32),
             })
 
         return result
@@ -660,7 +752,7 @@ class UnifiedGenerationDataset(Dataset):
             self.new_token_ids['end_of_image'],    # <|vision_end|>
         ]
 
-        # 图像相关文本token不参与CE损失
+        # 图像相关文本token的label会在外层进行重定向，使<|vision_start|>由前一个token预测
         image_label_ids = [
             self.new_token_ids['start_of_image'],
             self.new_token_ids['end_of_image'],

@@ -12,15 +12,16 @@
 3. 保持FSDP、EMA、检查点等所有成熟功能
 """
 
+from dataclasses import dataclass, field
 import functools
+import logging
 import os
 import sys
+import time
 import wandb
 import yaml
-from copy import deepcopy
-from dataclasses import dataclass, field
 from pathlib import Path
-from time import time
+from copy import deepcopy
 from datetime import timedelta
 
 # 添加项目根目录到 Python 路径
@@ -53,7 +54,10 @@ from train.fsdp_utils import (
     FSDPCheckpoint, FSDPConfig, grad_checkpoint_check_fn, fsdp_wrapper, 
     fsdp_ema_setup, fsdp_ema_update,
 )
-from training.unified_data_processor import UnifiedGenerationDataset
+from training.unified_data_processor import (
+    UnifiedGenerationDataset,
+    DEFAULT_SYSTEM_PROMPT,
+)
 from data.transforms import ImageTransform
 
 
@@ -289,6 +293,10 @@ class TrainingArguments:
         default=1.0,
         metadata={"help": "Scaling factor for the image MSE loss term."}
     )
+    vision_start_ce_weight: float = field(
+        default=1.0,
+        metadata={"help": "Extra weight multiplier applied to <|vision_start|> tokens in the CE loss."}
+    )
     
     # --- 统一训练特定参数 ---
     batch_size: int = field(
@@ -344,6 +352,20 @@ class TrainingArguments:
         metadata={"help": "Duplicate initial MoE experts so each has identical initialisation."}
     )
     
+    # --- 调试选项 ---
+    debug_token_logging: bool = field(
+        default=False,
+        metadata={"help": "启用后，周期性打印token及其监督标签，便于排查数据/损失对齐问题。"}
+    )
+    debug_token_print_every: int = field(
+        default=1000,
+        metadata={"help": "每隔多少个数据批次打印一次token调试信息。"}
+    )
+    debug_token_max_tokens: int = field(
+        default=32,
+        metadata={"help": "调试日志中展示的token数量上限。"}
+    )
+
     # --- 内存管理配置 ---
     clear_cache: bool = field(
         default=True,
@@ -362,11 +384,23 @@ class UnifiedDatasetWrapper:
         dataset: UnifiedGenerationDataset,
         batch_size: int = 1,
         gradient_accumulation_steps: int = 8,
+        *,
+        tokenizer=None,
+        logger=None,
+        debug_token_logging: bool = False,
+        debug_token_print_every: int = 1000,
+        debug_token_max_tokens: int = 32,
     ):
         self.dataset = dataset
         self.batch_size = batch_size
         self.gradient_accumulation_steps = gradient_accumulation_steps
         self.current_step = 0
+        self.tokenizer = tokenizer
+        self.logger = logger or logging.getLogger(__name__)
+        self.debug_token_logging = debug_token_logging
+        self.debug_token_print_every = debug_token_print_every
+        self.debug_token_max_tokens = debug_token_max_tokens
+        self._warned_missing_tokenizer = False
         
     def __iter__(self):
         # 无限循环数据加载器，支持多epoch训练
@@ -436,12 +470,20 @@ class UnifiedDatasetWrapper:
         text_seq_len = input_ids.shape[0]  # 文本tokens的数量
         
         # 调试信息
-        if dist.get_rank() == 0:
-            print(f"Debug: real_seq_len={real_seq_len}, text_seq_len={text_seq_len}")
+        if self.debug_token_logging and self._is_rank0():
+            self.logger.debug(
+                "real_seq_len=%d, text_seq_len=%d",
+                real_seq_len,
+                text_seq_len,
+            )
             if 'packed_text_indexes' in batch:
-                text_indexes = remove_batch_dim(batch['packed_text_indexes'])
-                # print(f"Debug: text_indexes range=[{text_indexes.min()}, {text_indexes.max()}]")
-                # print(f"Debug: text_indexes shape={text_indexes.shape}")
+                debug_indexes = remove_batch_dim(batch['packed_text_indexes'])
+                if isinstance(debug_indexes, torch.Tensor) and debug_indexes.numel() > 0:
+                    self.logger.debug(
+                        "text_indexes range=[%d, %d]",
+                        int(debug_indexes.min().item()),
+                        int(debug_indexes.max().item()),
+                    )
         
         # 处理注意力掩码
         if 'nested_attention_masks' in batch and batch['nested_attention_masks']:
@@ -459,13 +501,23 @@ class UnifiedDatasetWrapper:
         if 'packed_text_indexes' in batch:
             text_indexes = remove_batch_dim(batch['packed_text_indexes'])
             if text_indexes.max() >= real_seq_len:
-                print(f"Error: text_indexes超出范围! max_index={text_indexes.max()}, seq_len={real_seq_len}")
+                if self._is_rank0():
+                    self.logger.warning(
+                        "检测到越界text_index: max_index=%d, seq_len=%d",
+                        int(text_indexes.max().item()),
+                        real_seq_len,
+                    )
                 # 过滤掉无效的索引
                 valid_mask = text_indexes < real_seq_len
                 if torch.any(valid_mask):
                     valid_text_indexes = text_indexes[valid_mask]
                     valid_text_ids = input_ids[valid_mask]
-                    print(f"Warning: 过滤后的文本tokens: {len(valid_text_ids)}/{len(input_ids)}")
+                    if self._is_rank0():
+                        self.logger.warning(
+                            "过滤后的文本tokens: %d/%d",
+                            len(valid_text_ids),
+                            len(input_ids),
+                        )
 
                     # 更新input_ids和indexes
                     input_ids = valid_text_ids
@@ -473,7 +525,8 @@ class UnifiedDatasetWrapper:
                     packed_label_ids = packed_label_ids[valid_mask]
                     text_token_loss_mask = text_token_loss_mask[valid_mask]
                 else:
-                    print(f"Error: 所有text_indexes都无效，无法继续处理")
+                    if self._is_rank0():
+                        self.logger.error("所有text_indexes都无效，无法继续处理")
                     raise ValueError("所有文本索引都超出序列范围")
 
         # 文本token在完整序列中的位置
@@ -513,7 +566,12 @@ class UnifiedDatasetWrapper:
                 # 验证VIT索引的有效性
                 vit_indexes = remove_batch_dim(batch['packed_vit_token_indexes'])
                 if vit_indexes.max() >= real_seq_len:
-                    print(f"Warning: VIT索引超出范围! max_index={vit_indexes.max()}, seq_len={real_seq_len}")
+                    if self._is_rank0():
+                        self.logger.warning(
+                            "VIT索引超出范围: max_index=%d, seq_len=%d",
+                            int(vit_indexes.max().item()),
+                            real_seq_len,
+                        )
                     # 过滤掉无效的索引
                     valid_vit_mask = vit_indexes < real_seq_len
                     if torch.any(valid_vit_mask):
@@ -528,7 +586,8 @@ class UnifiedDatasetWrapper:
                             'vit_token_seqlens': vit_seqlens.to(device),
                         })
                     else:
-                        print(f"Warning: 所有VIT索引都无效，跳过VIT处理")
+                        if self._is_rank0():
+                            self.logger.warning("所有VIT索引都无效，跳过VIT数据处理")
                 else:
                     data_dict.update({
                         'packed_vit_tokens': remove_batch_dim(batch['packed_vit_tokens']).to(device),
@@ -538,12 +597,12 @@ class UnifiedDatasetWrapper:
                     })
             else:
                 # VIT数据无效，跳过VIT相关字段
-                if dist.get_rank() == 0:
-                    print(f"Warning: Invalid or empty vit_token_seqlens: {vit_seqlens}")
+                if self._is_rank0():
+                    self.logger.warning("vit_token_seqlens无效或为空: %s", vit_seqlens)
         elif 'packed_vit_tokens' in batch:
             # 有VIT tokens但没有seqlens，这是数据不一致的情况
-            if dist.get_rank() == 0:
-                print("Warning: Found packed_vit_tokens but missing vit_token_seqlens")
+            if self._is_rank0():
+                self.logger.warning("存在packed_vit_tokens但缺少vit_token_seqlens")
         
         # 如果有VAE图像数据
         if 'padded_vae_images' in batch:
@@ -585,7 +644,12 @@ class UnifiedDatasetWrapper:
             # 确保VAE索引不超出序列长度
             valid_vae_indexes = vae_indexes[vae_indexes < real_seq_len]
             if len(valid_vae_indexes) < len(vae_indexes):
-                print(f"Warning: Some VAE indexes ({len(vae_indexes) - len(valid_vae_indexes)}) exceed sequence length")
+                if self._is_rank0():
+                    self.logger.warning(
+                        "部分VAE索引越界: %d/%d",
+                        len(vae_indexes) - len(valid_vae_indexes),
+                        len(vae_indexes),
+                    )
             
             mse_mask = torch.zeros(real_seq_len, dtype=torch.bool, device=device)
             if len(valid_vae_indexes) > 0:
@@ -605,9 +669,83 @@ class UnifiedDatasetWrapper:
             'data_indexes': list(range(len(input_ids))),
         }]
         
-        
+
         return self._to_cuda_dict(data_dict, device)
-    
+
+    def _is_rank0(self) -> bool:
+        if not dist.is_available():
+            return True
+        if not dist.is_initialized():
+            return True
+        return dist.get_rank() == 0
+
+    def _log_token_debug(self, sequence_length, text_ids, text_positions, loss_mask, filtered_label_ids):
+        if not self.debug_token_logging:
+            return
+        if (self.current_step % self.debug_token_print_every) != 0:
+            return
+        if not self._is_rank0():
+            return
+        if self.tokenizer is None:
+            if not self._warned_missing_tokenizer:
+                self.logger.warning("已启用token调试日志，但未提供tokenizer，跳过打印。")
+                self._warned_missing_tokenizer = True
+            return
+
+        total_tokens = text_ids.numel()
+        if total_tokens == 0:
+            return
+
+        max_tokens = min(self.debug_token_max_tokens, total_tokens)
+        text_id_list = text_ids[:max_tokens].tolist()
+        token_strings = self.tokenizer.convert_ids_to_tokens(text_id_list)
+        loss_mask_list = loss_mask[:max_tokens].tolist()
+        text_position_list = text_positions[:max_tokens].tolist()
+        label_list = filtered_label_ids.tolist()
+        label_idx = 0
+
+        special_map = {}
+        if hasattr(self.dataset, 'new_token_ids') and isinstance(self.dataset.new_token_ids, dict):
+            special_map = {v: k for k, v in self.dataset.new_token_ids.items()}
+
+        rows = []
+        for idx in range(max_tokens):
+            token_id = text_id_list[idx]
+            token_repr = token_strings[idx]
+            if token_id in special_map:
+                token_repr = f"{token_repr}({special_map[token_id]})"
+
+            needs_loss = bool(loss_mask_list[idx])
+            label_id = None
+            label_repr = "-"
+            if needs_loss:
+                if label_idx < len(label_list):
+                    label_id = label_list[label_idx]
+                    label_repr = self.tokenizer.convert_ids_to_tokens([label_id])[0]
+                    if label_id in special_map:
+                        label_repr = f"{label_repr}({special_map[label_id]})"
+                label_idx += 1
+
+            row = (
+                f"pos={text_position_list[idx]:04d} "
+                f"token_id={token_id} token={token_repr} loss={int(needs_loss)}"
+            )
+            if label_id is not None:
+                row += f" target_id={label_id} target={label_repr}"
+            else:
+                row += " target_id=- target=-"
+            rows.append(row)
+
+        ce_tokens = int(sum(loss_mask_list))
+        self.logger.info(
+            "[TokenDebug step=%d] seq_len=%d text_tokens=%d ce_tokens=%d\n%s",
+            self.current_step,
+            sequence_length,
+            total_tokens,
+            ce_tokens,
+            "\n".join(rows),
+        )
+
     def _to_cuda_dict(self, data_dict, device):
         """将数据字典转换为CUDA字典类"""
         class CudaDict:
@@ -632,7 +770,7 @@ class UnifiedDatasetWrapper:
             
             def keys(self):
                 return self._data.keys()
-        
+
         return CudaDict(data_dict, device)
 
 
@@ -651,8 +789,9 @@ def create_unified_dataset(data_args, model_args, tokenizer, new_token_ids):
         new_token_ids=new_token_ids,
         max_sequence_length=data_args.max_sequence_length,
         max_image_tokens=data_args.max_image_tokens,
+        system_prompt=DEFAULT_SYSTEM_PROMPT,
     )
-    
+
     # 验证数据集（可选）
     val_dataset = None
     if data_args.val_data_path:
@@ -664,6 +803,7 @@ def create_unified_dataset(data_args, model_args, tokenizer, new_token_ids):
             new_token_ids=new_token_ids,
             max_sequence_length=data_args.max_sequence_length,
             max_image_tokens=data_args.max_image_tokens,
+            system_prompt=DEFAULT_SYSTEM_PROMPT,
         )
     
     return dataset, val_dataset
@@ -903,7 +1043,14 @@ def main():
         unified_dataset,
         batch_size=training_args.batch_size,
         gradient_accumulation_steps=training_args.gradient_accumulation_steps,
+        tokenizer=tokenizer,
+        logger=logger,
+        debug_token_logging=training_args.debug_token_logging,
+        debug_token_print_every=training_args.debug_token_print_every,
+        debug_token_max_tokens=training_args.debug_token_max_tokens,
     )
+
+    start_of_image_id = new_token_ids.get('start_of_image')
 
     # Prepare models for training:
     if training_args.visual_gen:
@@ -912,7 +1059,7 @@ def main():
     ema_model.eval()
 
     # === 修改后的训练循环 ===
-    start_time = time()
+    start_time = time.perf_counter()
     logger.info(f"Training for {training_args.total_steps} steps, starting at {train_step}...")
     
     gradient_accumulation_counter = 0
@@ -932,7 +1079,9 @@ def main():
 
         # 统一训练的损失计算
         loss = 0
-        
+        total_ce_tokens = torch.tensor(0, device=device)
+        total_ce_token_weight = torch.tensor(0.0, device=device, dtype=torch.float32)
+
         # 文本损失
         ce = loss_dict.get("ce")
         if ce is not None:
@@ -941,13 +1090,40 @@ def main():
                 ce_mask = torch.tensor(ce_mask, device=device, dtype=torch.bool)
             total_ce_tokens = ce_mask.long().sum()
             dist.all_reduce(total_ce_tokens, op=dist.ReduceOp.SUM)
-            if total_ce_tokens.item() > 0:
-                ce = ce.sum() * dist.get_world_size() / total_ce_tokens
+
+            labels = data.get('packed_label_ids')
+            if labels is None:
+                labels = torch.empty(0, device=device, dtype=torch.long)
+            elif not torch.is_tensor(labels):
+                labels = torch.tensor(labels, device=device, dtype=torch.long)
+
+            if labels.device != ce.device:
+                labels = labels.to(ce.device)
+
+            weights = torch.ones_like(ce)
+            if start_of_image_id is not None and training_args.vision_start_ce_weight != 1.0:
+                if labels.numel() == ce.numel():
+                    weights = weights.clone()
+                    weights[labels == start_of_image_id] = training_args.vision_start_ce_weight
+                else:
+                    if dist.get_rank() == 0:
+                        logger.warning(
+                            "packed_label_ids size (%d) and CE tensor size (%d) mismatch; skipping <|vision_start|> weighting.",
+                            labels.numel(),
+                            ce.numel(),
+                        )
+            weights = weights.to(ce.device)
+            total_ce_token_weight = weights.float().sum()
+            dist.all_reduce(total_ce_token_weight, op=dist.ReduceOp.SUM)
+
+            if total_ce_token_weight.item() > 0:
+                ce = (ce * weights).sum() * dist.get_world_size() / total_ce_token_weight
                 loss_dict["ce"] = ce.detach()
                 loss = loss + ce * training_args.text_loss_weight
+            else:
+                loss_dict["ce"] = torch.tensor(0.0, device=device)
         else:
-            loss_dict["ce"] = torch.tensor(0, device=device)
-            total_ce_tokens = torch.tensor(0, device=device)
+            loss_dict["ce"] = torch.tensor(0.0, device=device)
 
         # 图像损失
         if training_args.visual_gen:
@@ -994,8 +1170,9 @@ def main():
 
             # Measure training speed:
             torch.cuda.synchronize()
-            end_time = time()
-            steps_per_sec = training_args.log_every / (end_time - start_time)
+            end_time = time.perf_counter()
+            elapsed = max(end_time - start_time, 1e-6)
+            steps_per_sec = training_args.log_every / elapsed
             message = f"(step={curr_step:07d}) "
             wandb_log = {}
             for key, value in loss_dict.items():
@@ -1011,6 +1188,7 @@ def main():
             wandb_log['lr'] = optimizer.param_groups[0]['lr']
             wandb_log['total_mse_tokens'] = total_mse_tokens.item()
             wandb_log['total_ce_tokens'] = total_ce_tokens.item()
+            wandb_log['weighted_ce_tokens'] = total_ce_token_weight.item()
             wandb_log['total_samples'] = total_samples.item()
             wandb_log['gradient_accumulation_counter'] = gradient_accumulation_counter
 
@@ -1023,7 +1201,7 @@ def main():
 
             if dist.get_rank() == 0:
                 wandb.log(wandb_log, step=curr_step)
-            start_time = time()
+            start_time = time.perf_counter()
 
         if data_status is None:
             data_status = {}

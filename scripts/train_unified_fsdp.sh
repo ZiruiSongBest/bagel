@@ -212,6 +212,7 @@ else
         \
         --results_dir "$output_path" \
         --checkpoint_dir "$ckpt_path" \
+        --vision_start_ce_weight 2.0 \
         \
         --wandb_project "$wandb_project" \
         --wandb_name "$wandb_name" \

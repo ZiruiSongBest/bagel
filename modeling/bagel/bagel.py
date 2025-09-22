@@ -650,47 +650,7 @@ class Bagel(PreTrainedModel):
             'loss_mask': loss_mask,
             'sequence_length': len(unified_tokens)
         }
-    
-    def forward_autoregressive_training_example(self):
-        """
-        统一序列建模的使用示例：
-        
-        # 训练数据构建：
-        # 输入: "用户问题" + input_image
-        # 输出: "思考文本1 <|vision_start|><|vision_end|> 思考文本2 <|vision_start|><|vision_end|>"
-        
-        # 1. 原始目标序列（已经包含特殊token）
-        target_sequence_text = "我来分析这个问题 <|vision_start|><|vision_end|> 基于上图，我认为 <|vision_start|><|vision_end|>"
-        
-        # 2. Tokenize目标序列（特殊token会被正确编码）
-        target_tokens = tokenizer.encode(target_sequence_text)
-        # 结果类似：[token1, token2, start_of_image_id, end_of_image_id, token3, token4, start_of_image_id, end_of_image_id]
-        
-        # 3. 对应的图像列表
-        target_images = [generated_image1, generated_image2]  # 与<|vision_start|>位置对应
-        
-        # 4. 调用统一训练方法
-        loss = model.forward_autoregressive_training(
-            input_text="请分析这张图片",
-            input_image=input_image,
-            target_tokens=target_tokens,  # 统一的token序列
-            target_images=target_images,  # 对应的图像
-            tokenizer=tokenizer,
-            vae_model=vae_model,
-            new_token_ids=new_token_ids
-        )
-        
-        # 返回的loss包含：
-        # - text_loss: 文本token和特殊token的CE loss
-        # - image_loss: 图像token的Flow Matching loss  
-        # - special_token_loss: 特殊token的单独统计
-        
-        # 关键优势：
-        # 1. 模型学会何时输出<|vision_start|>token（时序控制）
-        # 2. 统一的序列建模，训练推理一致
-        # 3. 分层次的loss设计，确保时序和内容质量
-        """
-        pass
+
     
     def _process_text_generation_step(
         self,
