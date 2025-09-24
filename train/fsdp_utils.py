@@ -14,11 +14,15 @@ from torch.distributed.fsdp import (
     MixedPrecision,
     BackwardPrefetch,
     ShardingStrategy,
-    FullStateDictConfig,
-    StateDictType,
 )
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from safetensors.torch import load_file, save_file
+from torch.distributed._shard.sharded_tensor import ShardedTensor
+from torch.distributed.checkpoint.state_dict import (
+    get_state_dict as checkpoint_get_state_dict,
+    set_state_dict as checkpoint_set_state_dict,
+    StateDictOptions,
+)
 
 from modeling.bagel.modeling_utils import MLPconnector, TimestepEmbedder, PositionEmbedding
 from modeling.bagel.qwen2_navit import (
@@ -85,6 +89,22 @@ def fsdp_wrapper(original_model, fsdp_config, ignored_modules=[]):
 
 class FSDPCheckpoint:
     @staticmethod
+    def _materialize_local_state(state_dict):
+        """Convert ShardedTensor shards to plain CPU tensors for safetensors."""
+        materialized = {}
+        for key, value in state_dict.items():
+            if isinstance(value, ShardedTensor):
+                tensor = value.local_tensor()
+            else:
+                tensor = value
+
+            if isinstance(tensor, torch.Tensor):
+                materialized[key] = tensor.detach().cpu()
+            else:
+                materialized[key] = tensor
+        return materialized
+
+    @staticmethod
     def fsdp_save_ckpt(
         ckpt_dir, 
         train_steps, 
@@ -96,49 +116,57 @@ class FSDPCheckpoint:
         logger, 
         fsdp_config,
     ):
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
         save_path = os.path.join(ckpt_dir, f"{train_steps:07d}")
         os.makedirs(save_path, exist_ok=True)
-        logger.info(f"Saving checkpoint to {save_path}.")
+        if rank == 0:
+            logger.info(f"Saving checkpoint shards to {save_path}.")
 
         if ema_model is not None:
-            with FSDP.state_dict_type(
+            # Store EMA parameters per rank to avoid aggregating the full model in host RAM.
+            ema_state_dict, _ = checkpoint_get_state_dict(
                 ema_model,
-                StateDictType.FULL_STATE_DICT,
-                FullStateDictConfig(rank0_only=True, offload_to_cpu=True),
-            ):
-                ema_state_dict = ema_model.state_dict()
-                if dist.get_rank() == 0:
-                    save_file(ema_state_dict, os.path.join(save_path, "ema.safetensors"))
-
-        with FSDP.state_dict_type(
-            model,
-            StateDictType.FULL_STATE_DICT,
-            FullStateDictConfig(rank0_only=True, offload_to_cpu=True),
-        ):
-            model_state_dict = model.state_dict()
-            if dist.get_rank() == 0:
-                save_file(model_state_dict, os.path.join(save_path, "model.safetensors"))
-
-        with FSDP.state_dict_type(model, StateDictType.LOCAL_STATE_DICT):
-            if fsdp_config.sharding_strategy == "FULL_SHARD":
-                shard_index = dist.get_rank()
-                total_shards = dist.get_world_size()
-            elif fsdp_config.sharding_strategy == "HYBRID_SHARD":
-                shard_index = dist.get_rank() % fsdp_config.num_shard
-                total_shards = fsdp_config.num_shard
-            else:
-                raise NotImplementedError
-
-            optimizer_save_path = os.path.join(
-                save_path, f"optimizer.{shard_index:05d}-of-{total_shards:05d}.pt"
+                optimizers=[],
+                options=StateDictOptions(cpu_offload=True, full_state_dict=False),
             )
-            if fsdp_config.sharding_strategy == "FULL_SHARD":
+            ema_state_dict = FSDPCheckpoint._materialize_local_state(ema_state_dict)
+            ema_path = os.path.join(
+                save_path, f"ema.rank{rank:05d}-of-{world_size:05d}.safetensors"
+            )
+            save_file(ema_state_dict, ema_path)
+
+        # Save the trainable weights as per-rank shards.
+        model_state_dict, _ = checkpoint_get_state_dict(
+            model,
+            optimizers=[],
+            options=StateDictOptions(cpu_offload=True, full_state_dict=False),
+        )
+        model_state_dict = FSDPCheckpoint._materialize_local_state(model_state_dict)
+        model_path = os.path.join(
+            save_path, f"model.rank{rank:05d}-of-{world_size:05d}.safetensors"
+        )
+        save_file(model_state_dict, model_path)
+
+        if fsdp_config.sharding_strategy == "FULL_SHARD":
+            shard_index = dist.get_rank()
+            total_shards = dist.get_world_size()
+        elif fsdp_config.sharding_strategy == "HYBRID_SHARD":
+            shard_index = dist.get_rank() % fsdp_config.num_shard
+            total_shards = fsdp_config.num_shard
+        else:
+            raise NotImplementedError
+
+        optimizer_save_path = os.path.join(
+            save_path, f"optimizer.{shard_index:05d}-of-{total_shards:05d}.pt"
+        )
+        if fsdp_config.sharding_strategy == "FULL_SHARD":
+            torch.save(optimizer.state_dict(), optimizer_save_path)
+        elif fsdp_config.sharding_strategy == "HYBRID_SHARD":
+            if dist.get_rank() < fsdp_config.num_shard:
                 torch.save(optimizer.state_dict(), optimizer_save_path)
-            elif fsdp_config.sharding_strategy == "HYBRID_SHARD":
-                if dist.get_rank() < fsdp_config.num_shard:
-                    torch.save(optimizer.state_dict(), optimizer_save_path)
-            else:
-                raise NotImplementedError
+        else:
+            raise NotImplementedError
 
         if dist.get_rank() == 0 and scheduler is not None:
             torch.save(scheduler.state_dict(), os.path.join(save_path, "scheduler.pt"))
@@ -153,32 +181,52 @@ class FSDPCheckpoint:
     def try_load_ckpt(resume_from, logger, model, ema_model=None, resume_from_ema=False):
         if resume_from is not None and os.path.exists(resume_from):
             logger.info(f"Loading checkpoint from {resume_from}.")
-            if resume_from_ema:
-                model_state_dict_path = os.path.join(resume_from, f"ema.safetensors")
-            else:
-                model_state_dict_path = os.path.join(resume_from, f"model.safetensors")
-            model_state_dict = load_file(model_state_dict_path, device="cpu")
-            # NOTE position embeds are fixed sinusoidal embeddings, so we can just pop it off,
-            # which makes it easier to adapt to different resolutions.
-            model_state_dict.pop('latent_pos_embed.pos_embed')
-            model_state_dict.pop('vit_pos_embed.pos_embed')
-            msg = model.load_state_dict(model_state_dict, strict=False)
-            logger.info(msg)
-            del model_state_dict
+            rank = dist.get_rank()
+            world_size = dist.get_world_size()
+
+            def _resolve_state(prefix: str):
+                local_name = f"{prefix}.rank{rank:05d}-of-{world_size:05d}.safetensors"
+                full_name = f"{prefix}.safetensors"
+                local_path = os.path.join(resume_from, local_name)
+                full_path = os.path.join(resume_from, full_name)
+                if os.path.exists(local_path):
+                    return "local", local_path
+                if os.path.exists(full_path):
+                    return "full", full_path
+                return None, None
+
+            def _load_state(target_model, state_kind, state_path):
+                state_dict = load_file(state_path, device="cpu")
+                state_dict.pop('latent_pos_embed.pos_embed', None)
+                state_dict.pop('vit_pos_embed.pos_embed', None)
+
+                if state_kind == "local":
+                    msg = checkpoint_set_state_dict(
+                        target_model,
+                        optimizers=[],
+                        model_state_dict=state_dict,
+                        optim_state_dict={},
+                        options=StateDictOptions(cpu_offload=True, full_state_dict=False),
+                    )
+                else:
+                    msg = target_model.load_state_dict(state_dict, strict=False)
+                logger.info(msg)
+
+            primary_prefix = "ema" if resume_from_ema else "model"
+            state_kind, model_state_dict_path = _resolve_state(primary_prefix)
+            if model_state_dict_path is None:
+                raise FileNotFoundError(
+                    f"Could not find checkpoint file for prefix '{primary_prefix}' in {resume_from}."
+                )
+
+            _load_state(model, state_kind, model_state_dict_path)
 
             if ema_model is not None:
-                ema_state_dict_path = os.path.join(resume_from, f"ema.safetensors")
-                if not os.path.exists(ema_state_dict_path):
+                ema_state_kind, ema_state_path = _resolve_state("ema")
+                if ema_state_path is None:
                     logger.info(f"replicaing ema model from {model_state_dict_path}.")
-                    ema_state_dict_path = model_state_dict_path
-                ema_state_dict = load_file(ema_state_dict_path, device="cpu")
-                # NOTE position embeds are fixed sinusoidal embeddings, so we can just pop it off,
-                # which makes it easier to adapt to different resolutions.
-                ema_state_dict.pop('latent_pos_embed.pos_embed')
-                ema_state_dict.pop('vit_pos_embed.pos_embed')
-                msg = ema_model.load_state_dict(ema_state_dict, strict=False)
-                logger.info(msg)
-                del ema_state_dict
+                    ema_state_kind, ema_state_path = state_kind, model_state_dict_path
+                _load_state(ema_model, ema_state_kind, ema_state_path)
         else:
             logger.info(f"Training from scratch.")
         return model, ema_model

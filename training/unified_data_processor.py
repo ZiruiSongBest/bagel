@@ -16,6 +16,7 @@ import json
 import torch
 import random
 from typing import List, Dict, Union, Optional, Tuple, Any
+from pathlib import Path
 from PIL import Image
 import numpy as np
 from torch.utils.data import Dataset, DataLoader
@@ -84,6 +85,12 @@ class UnifiedGenerationDataset(Dataset):
             multimodal_prob: 多模态混合任务的概率
         """
         self.data_path = data_path  # 保存数据路径用于相对路径解析
+        # 尽可能复用官方脚本的resume信息格式
+        data_path_obj = Path(data_path)
+        if data_path_obj.is_file():
+            self.dataset_name = data_path_obj.stem
+        else:
+            self.dataset_name = data_path_obj.name or "unified_dataset"
         self.tokenizer = tokenizer
         self.vae_transform = vae_transform
         self.vit_transform = vit_transform
@@ -445,9 +452,9 @@ class UnifiedGenerationDataset(Dataset):
         example = self.examples[idx]
         
         # 转换为模型训练格式
-        return self._convert_to_training_format(example)
+        return self._convert_to_training_format(example, idx)
     
-    def _convert_to_training_format(self, example: UnifiedTrainingExample) -> Dict[str, Any]:
+    def _convert_to_training_format(self, example: UnifiedTrainingExample, sample_index: int) -> Dict[str, Any]:
         """将训练样本转换为模型可处理的格式"""
         
         # 构建完整序列：输入 + 目标
@@ -464,13 +471,33 @@ class UnifiedGenerationDataset(Dataset):
         text_loss_mask = processed_data.pop('text_loss_mask')
         image_loss_mask = processed_data.pop('image_loss_mask')
 
+        sample_metadata = example.metadata or {}
+
+        # 与官方PackedDataset对齐，提供简洁的数据索引信息，方便checkpoint恢复
+        data_index_entry = sample_metadata.get('data_indexes')
+        if isinstance(data_index_entry, dict):
+            formatted_data_indexes = data_index_entry
+        else:
+            if data_index_entry is None:
+                data_index_entry = sample_metadata.get('sample_id', sample_index)
+            if isinstance(data_index_entry, (list, tuple)):
+                data_index_list = list(data_index_entry)
+            else:
+                data_index_list = [data_index_entry]
+            formatted_data_indexes = {
+                'dataset_name': sample_metadata.get('dataset_name', self.dataset_name),
+                'worker_id': sample_metadata.get('worker_id', 0),
+                'data_indexes': data_index_list,
+            }
+
         return {
             **processed_data,
             'text_loss_mask': text_loss_mask,
             'image_loss_mask': image_loss_mask,
             'input_length': input_length,
             'target_length': target_length,
-            'metadata': example.metadata or {}
+            'metadata': sample_metadata,
+            'data_indexes': formatted_data_indexes,
         }
     
     def _process_mixed_sequence(

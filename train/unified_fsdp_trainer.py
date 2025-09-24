@@ -18,6 +18,7 @@ import logging
 import os
 import sys
 import time
+from typing import Optional
 import wandb
 import yaml
 from pathlib import Path
@@ -401,6 +402,7 @@ class UnifiedDatasetWrapper:
         self.debug_token_print_every = debug_token_print_every
         self.debug_token_max_tokens = debug_token_max_tokens
         self._warned_missing_tokenizer = False
+        self._global_sample_counter = 0
         
     def __iter__(self):
         # 无限循环数据加载器，支持多epoch训练
@@ -661,16 +663,154 @@ class UnifiedDatasetWrapper:
         
         # 修复 sample_lens - 使用数据集提供的值
         data_dict['sample_lens'] = batch.get('sample_lens', [real_seq_len])
-        
-        # 添加虚拟的数据索引信息（用于检查点恢复）
-        data_dict['batch_data_indexes'] = [{
-            'dataset_name': 'unified_dataset',
-            'worker_id': 0,
-            'data_indexes': list(range(len(input_ids))),
-        }]
+
+        # 构建与官方脚本一致的数据索引，避免保存checkpoint时占用巨量内存
+        batch_data_indexes = self._normalize_batch_data_indexes(
+            batch.get('data_indexes'),
+            sample_hint=self.batch_size,
+            metadata=batch.get('metadata'),
+        )
+        data_dict['batch_data_indexes'] = batch_data_indexes
         
 
         return self._to_cuda_dict(data_dict, device)
+
+    def _normalize_batch_data_indexes(self, raw_indexes, sample_hint: int, metadata):
+        """将数据集返回的索引结构转换为官方脚本使用的列表格式"""
+        normalized = []
+
+        def _as_scalar(value, default):
+            if isinstance(value, (list, tuple)):
+                if len(value) == 0:
+                    return default
+                return _as_scalar(value[0], default)
+            if value is None:
+                return default
+            return value
+
+        def _ensure_dataset_name(value):
+            scalar = _as_scalar(value, 'unified_dataset')
+            return str(scalar)
+
+        def _ensure_worker_id(value):
+            scalar = _as_scalar(value, 0)
+            try:
+                return int(scalar)
+            except (TypeError, ValueError):
+                return 0
+
+        def _ensure_index_list(value, fallback):
+            if isinstance(value, dict):
+                value = value.get('data_indexes', fallback)
+            if isinstance(value, (list, tuple)):
+                result = []
+                for elem in value:
+                    scalar = _as_scalar(elem, fallback)
+                    try:
+                        result.append(int(scalar))
+                    except (TypeError, ValueError):
+                        continue
+                if result:
+                    return result
+                return [fallback]
+            scalar = _as_scalar(value, fallback)
+            try:
+                return [int(scalar)]
+            except (TypeError, ValueError):
+                return [fallback]
+
+        if raw_indexes is None:
+            # 退化情况：为每个样本分配自增索引，保持checkpoint可恢复
+            sample_count = self._infer_sample_count_from_metadata(metadata) or sample_hint or 1
+            for _ in range(sample_count):
+                normalized.append({
+                    'dataset_name': 'unified_dataset',
+                    'worker_id': 0,
+                    'data_indexes': [self._global_sample_counter],
+                })
+                self._global_sample_counter += 1
+            return normalized
+
+        # DataLoader的默认collate可能将dict展开为dict of lists，需要兼容这两种结构
+        if isinstance(raw_indexes, dict) and all(
+            isinstance(v, list) for v in raw_indexes.values()
+        ):
+            length = len(next(iter(raw_indexes.values())))
+            for idx in range(length):
+                dataset_name = _ensure_dataset_name(
+                    raw_indexes.get('dataset_name', ['unified_dataset'] * length)[idx]
+                )
+                worker_id = _ensure_worker_id(
+                    raw_indexes.get('worker_id', [0] * length)[idx]
+                )
+                fallback_idx = self._global_sample_counter
+                data_idx_value = _ensure_index_list(
+                    raw_indexes.get('data_indexes', [fallback_idx] * length)[idx],
+                    fallback_idx,
+                )
+                normalized.append({
+                    'dataset_name': dataset_name,
+                    'worker_id': worker_id,
+                    'data_indexes': data_idx_value,
+                })
+                self._global_sample_counter += 1
+            return normalized
+
+        if isinstance(raw_indexes, list):
+            for item in raw_indexes:
+                if isinstance(item, dict):
+                    dataset_name = _ensure_dataset_name(item.get('dataset_name', 'unified_dataset'))
+                    worker_id = _ensure_worker_id(item.get('worker_id', 0))
+                    fallback_idx = self._global_sample_counter
+                    data_idx_value = _ensure_index_list(item.get('data_indexes', fallback_idx), fallback_idx)
+                else:
+                    dataset_name = 'unified_dataset'
+                    worker_id = 0
+                    fallback_idx = self._global_sample_counter
+                    data_idx_value = _ensure_index_list(item, fallback_idx)
+                normalized.append({
+                    'dataset_name': dataset_name,
+                    'worker_id': worker_id,
+                    'data_indexes': data_idx_value,
+                })
+                self._global_sample_counter += 1
+            return normalized
+
+        if isinstance(raw_indexes, dict):
+            dataset_name = _ensure_dataset_name(raw_indexes.get('dataset_name', 'unified_dataset'))
+            worker_id = _ensure_worker_id(raw_indexes.get('worker_id', 0))
+            fallback_idx = self._global_sample_counter
+            data_idx_value = _ensure_index_list(raw_indexes.get('data_indexes', fallback_idx), fallback_idx)
+            normalized.append({
+                'dataset_name': dataset_name,
+                'worker_id': worker_id,
+                'data_indexes': data_idx_value,
+            })
+            self._global_sample_counter += 1
+            return normalized
+
+        # 兜底：将原始值视为单个索引
+        normalized.append({
+            'dataset_name': 'unified_dataset',
+            'worker_id': 0,
+            'data_indexes': _ensure_index_list(raw_indexes, self._global_sample_counter),
+        })
+        self._global_sample_counter += 1
+        return normalized
+
+    def _infer_sample_count_from_metadata(self, metadata) -> Optional[int]:
+        """尝试从metadata推断当前batch内的样本数量"""
+        if metadata is None:
+            return None
+        if isinstance(metadata, (list, tuple)):
+            return len(metadata)
+        if isinstance(metadata, dict):
+            # default_collate会把字段拆成列表
+            values = [v for v in metadata.values() if isinstance(v, list)]
+            if values:
+                return len(values[0])
+            return 1
+        return 1
 
     def _is_rank0(self) -> bool:
         if not dist.is_available():
