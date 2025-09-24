@@ -93,6 +93,11 @@ class InterleaveInferencer:
                 transforms=self.vae_transform, 
                 new_token_ids=self.new_token_ids,
             )
+            device = next(self.model.parameters()).device
+            generation_input = {
+                k: (v.to(device) if isinstance(v, torch.Tensor) else v)
+                for k, v in generation_input.items()
+            }
             past_key_values = self.model.forward_cache_update_vae(self.vae_model, past_key_values, **generation_input)
         
         if vit:
@@ -104,6 +109,11 @@ class InterleaveInferencer:
                 transforms=self.vit_transform, 
                 new_token_ids=self.new_token_ids,
             )
+            device = next(self.model.parameters()).device
+            generation_input = {
+                k: (v.to(device) if isinstance(v, torch.Tensor) else v)
+                for k, v in generation_input.items()
+            }
             past_key_values = self.model.forward_cache_update_vit(past_key_values, **generation_input)
 
         gen_context['kv_lens'] = kv_lens
@@ -202,7 +212,14 @@ class InterleaveInferencer:
         return image
 
     @torch.no_grad()
-    def gen_text(self, gen_context, max_length: int = 500, do_sample: bool = True, temperature: float = 1.0):
+    def gen_text(
+        self,
+        gen_context,
+        max_length: int = 500,
+        do_sample: bool = True,
+        temperature: float = 1.0,
+        return_tokens: bool = False,
+    ):
         gen_context = deepcopy(gen_context)
         past_key_values = gen_context['past_key_values']
         kv_lens = gen_context['kv_lens']
@@ -219,6 +236,11 @@ class InterleaveInferencer:
         )
         output = self.tokenizer.decode(unpacked_latent[:,0])
         output = output.split('<|im_end|>')[0].split('<|im_start|>')[1]
+
+        if return_tokens:
+            generated_tokens = unpacked_latent[:, 0].tolist()
+            return output, generated_tokens
+
         return output
         
     @torch.no_grad()

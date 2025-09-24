@@ -1207,7 +1207,7 @@ def main():
     for curr_step, data in enumerate(dataset_wrapper, start=train_step):
         if curr_step >= training_args.total_steps:
             break
-            
+        
         data = data.cuda(device).to_dict()
         data_indexes = data.pop('batch_data_indexes', None)
         
@@ -1351,7 +1351,11 @@ def main():
                     data_status[item['dataset_name']] = {}
                 data_status[item['dataset_name']][item['worker_id']] = item['data_indexes']
 
-        if curr_step > 0 and curr_step % training_args.save_every == 0:
+        if (
+            training_args.save_every > 0
+            and curr_step > 0
+            and curr_step % training_args.save_every == 0
+        ):
             # 在保存checkpoint前清理CUDA缓存以避免内存不足错误
             if training_args.clear_cache:
                 torch.cuda.empty_cache()

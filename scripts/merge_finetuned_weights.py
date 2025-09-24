@@ -118,7 +118,8 @@ def main():
                 tensor = ensure_shapes_match(header[key], tensor, key)
                 start, end = header[key]["data_offsets"]
                 expected_nbytes = end - start
-                buffer = tensor.cpu().numpy().tobytes()
+                byte_view = tensor.view(torch.uint8)
+                buffer = byte_view.numpy().tobytes()
                 if len(buffer) != expected_nbytes:
                     raise ValueError(
                         f"Byte size mismatch for {key}: produced {len(buffer)} bytes, expected {expected_nbytes}."

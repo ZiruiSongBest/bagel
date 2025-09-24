@@ -581,7 +581,7 @@ class UnifiedGenerationDataset(Dataset):
                         target_vae_token_indexes.extend(vae_token_range)
                 
                 # 文本tokens (start_of_image + end_of_image)
-                # 修正索引：start_of_image在开始，end_of_image在所有图像tokens之后
+                # 修正索引：start_of_image在开始，end_of_image在所有图像tokens
                 start_of_image_idx = current_index
                 end_of_image_idx = current_index + 1 + vit_num_tokens + vae_num_tokens
 

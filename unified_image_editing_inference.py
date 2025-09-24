@@ -18,6 +18,7 @@ import numpy as np
 import logging
 import argparse
 from copy import deepcopy
+from contextlib import nullcontext
 
 # 添加项目根目录到路径
 current_dir = Path(__file__).resolve().parent
@@ -62,6 +63,15 @@ class UnifiedAutoregressiveInferencer:
         self.vit_transform = vit_transform
         self.new_token_ids = new_token_ids
         self.device = next(model.parameters()).device
+        # 基于官方推理器构建的辅助实例，用于直接复用图像生成流水线
+        self.interleave_helper = InterleaveInferencer(
+            model=self.model,
+            vae_model=self.vae_model,
+            tokenizer=self.tokenizer,
+            vae_transform=self.vae_transform,
+            vit_transform=self.vit_transform,
+            new_token_ids=self.new_token_ids,
+        )
         
         # 特殊token IDs
         self.start_of_image = new_token_ids.get('start_of_image')
@@ -111,14 +121,12 @@ class UnifiedAutoregressiveInferencer:
         print(f"🖼️  输入图像: {input_image.size if input_image else 'None'}")
         
         # 1. 处理输入阶段（对应训练的_process_input_stage）
-        input_embeddings, input_sequence_length = self._process_input_stage(
-            input_text, input_image
-        )
-        
+        encode_state = self._process_input_stage(input_text, input_image)
+
         # 2. 统一自回归生成（对应训练的_process_unified_autoregressive_training）
         generated_sequence = self._unified_autoregressive_generation(
-            input_embeddings=input_embeddings,
-            input_sequence_length=input_sequence_length,
+            encode_state=encode_state,
+            input_text=input_text,
             max_length=max_length,
             do_sample=do_sample,
             temperature=temperature,
@@ -137,86 +145,153 @@ class UnifiedAutoregressiveInferencer:
         return output_results
     
     def _process_input_stage(
-        self, 
-        input_text: str, 
-        input_image: Optional[Image.Image]
-    ) -> Tuple[torch.Tensor, int]:
-        """
-        处理输入阶段，对应训练时的_process_input_stage
-        
-        训练时的顺序：文本在前，图像在后
-        
-        Returns:
-            (input_embeddings, sequence_length)
-        """
-        sequence_parts = []
-        total_length = 0
-        
-        # 1. 处理输入文本 - 与训练保持一致，文本在前
-        text_ids = self.tokenizer.encode(input_text)
-        text_embedding = self.model.language_model.model.embed_tokens(
-            torch.tensor(text_ids, device=self.device)
+        self,
+        input_text: str,
+        input_image: Optional[Image.Image],
+    ) -> Dict[str, Any]:
+        """构建与官方推理器一致的编码上下文，返回缓存状态与元信息。"""
+
+        gen_context = self.interleave_helper.init_gen_context()
+        cfg_text_context = deepcopy(gen_context)
+        cfg_img_context = deepcopy(gen_context)
+
+        text_token_history: List[int] = []
+        processed_image_tensor = None
+        image_shape: Optional[Tuple[int, int]] = None
+
+        if input_image is not None and input_image.mode != "RGB":
+            input_image = input_image.convert("RGB")
+
+        context_image = input_image
+
+        autocast_ctx = (
+            torch.autocast(device_type=self.device.type, dtype=torch.bfloat16)
+            if self.device.type == "cuda" else nullcontext()
         )
-        
-        sequence_parts.append(text_embedding)
-        total_length += len(text_ids)
-        
-        # 2. 处理输入图像（如果存在）- 图像在文本之后
-        if input_image is not None:
-            # 转换图像格式
-            from data.data_utils import pil_img2rgb, patchify
-            
-            if input_image.mode != 'RGB':
-                input_image = input_image.convert('RGB')
-            
-            # 使用VIT变换处理图像
-            image_tensor = self.vit_transform(pil_img2rgb(input_image))
-            if image_tensor.dim() == 3:
-                image_tensor = image_tensor.unsqueeze(0)
-            
-            # 确保数据类型与模型权重一致
-            model_dtype = next(self.model.parameters()).dtype
-            image_tensor = image_tensor.to(dtype=model_dtype, device=self.device)
-            
-            # 使用ViT处理输入图像（对应训练逻辑）
-            vit_position_ids = self.model.get_flattened_position_ids(
-                image_tensor.size(2), image_tensor.size(3),
-                self.model.vit_patch_size,
-                max_num_patches_per_side=self.model.vit_max_num_patch_per_side
-            ).to(self.device)
-            
-            vit_tokens = patchify(image_tensor.squeeze(0), self.model.vit_patch_size)
-            
-            # 使用ViT模型处理
-            cu_seqlens = torch.tensor([0, vit_tokens.shape[0]], dtype=torch.int32, device=self.device)
-            vit_embeddings = self.model.vit_model(
-                packed_pixel_values=vit_tokens,
-                packed_flattened_position_ids=vit_position_ids,
-                cu_seqlens=cu_seqlens,
-                max_seqlen=vit_tokens.shape[0],
-            )
-            
-            # 应用连接器和位置编码
-            vit_embeddings = self.model.connector(vit_embeddings)
-            vit_pos_emb = self.model.vit_pos_embed(vit_position_ids)
-            vit_embeddings = vit_embeddings + vit_pos_emb
-            
-            sequence_parts.append(vit_embeddings)
-            total_length += len(vit_embeddings)
-        
-        # 3. 构建初始序列（与训练时的顺序一致：text_embedding + vit_embeddings）
-        input_embeddings = torch.cat(sequence_parts, dim=0)
-        
+
+        with autocast_ctx:
+            if input_text:
+                text_token_history = self.tokenizer.encode(input_text)
+                cfg_text_context = deepcopy(gen_context)
+                gen_context = self.interleave_helper.update_context_text(input_text, gen_context)
+                cfg_img_context = self.interleave_helper.update_context_text(input_text, cfg_img_context)
+
+            if context_image is not None:
+                processed_tensor = self.vae_transform.resize_transform(pil_img2rgb(context_image))
+                processed_image_tensor = processed_tensor
+                gen_context = self.interleave_helper.update_context_image(processed_tensor, gen_context)
+                image_shape = processed_tensor.size[::-1]
+                cfg_text_context = deepcopy(gen_context)
+
+        total_length = gen_context['kv_lens'][0] if gen_context['kv_lens'] else 0
+
         print(f"✅ 输入处理完成，序列长度: {total_length}")
-        print(f"📄 文本tokens: {len(text_ids)}")
-        if input_image is not None:
-            print(f"🖼️  图像patches: {len(vit_embeddings)}")
-        return input_embeddings, total_length
-    
+        print(f"📄 文本tokens: {len(text_token_history)}")
+        if image_shape is not None:
+            num_patches = image_shape[0] // self.model.latent_downsample * image_shape[1] // self.model.latent_downsample
+            print(f"🖼️  图像patches: {num_patches}")
+
+        return {
+            'gen_context': gen_context,
+            'cfg_text_context': cfg_text_context,
+            'cfg_img_context': cfg_img_context,
+            'text_token_history': text_token_history,
+            'context_image': context_image,
+            'processed_image': processed_image_tensor,
+            'sequence_length': total_length,
+            'image_shape': image_shape,
+        }
+
+    def _generate_text_with_helper(
+        self,
+        input_text: str,
+        context_image: Optional[Image.Image],
+        image_shape: Tuple[int, int],
+        max_length: int,
+        do_sample: bool,
+        temperature: float,
+        initial_contexts: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """复用官方推理器进行文本生成，并返回CFG所需的上下文。"""
+
+        autocast_ctx = (
+            torch.autocast(device_type=self.device.type, dtype=torch.bfloat16)
+            if self.device.type == "cuda" else nullcontext()
+        )
+
+        if initial_contexts is not None:
+            gen_context = deepcopy(initial_contexts['gen_context'])
+            cfg_text_context = deepcopy(initial_contexts['cfg_text_context'])
+            cfg_img_context = deepcopy(initial_contexts['cfg_img_context'])
+            inferred_image_shape = initial_contexts.get('image_shape') or image_shape
+
+            with autocast_ctx:
+                text_output, token_ids = self.interleave_helper.gen_text(
+                    gen_context,
+                    max_length=max_length,
+                    do_sample=do_sample,
+                    temperature=temperature,
+                    return_tokens=True,
+                )
+                if token_ids:
+                    decoded_with_special = self.tokenizer.decode(token_ids, skip_special_tokens=False)
+                else:
+                    decoded_with_special = text_output
+
+                gen_context_after_text = self.interleave_helper.update_context_text(decoded_with_special, gen_context)
+        else:
+            gen_context = self.interleave_helper.init_gen_context()
+            cfg_text_context = deepcopy(gen_context)
+            cfg_img_context = deepcopy(gen_context)
+
+            with autocast_ctx:
+                if input_text:
+                    cfg_text_context = deepcopy(gen_context)
+                    gen_context = self.interleave_helper.update_context_text(input_text, gen_context)
+                    cfg_img_context = self.interleave_helper.update_context_text(input_text, cfg_img_context)
+
+                inferred_image_shape = image_shape
+                if context_image is not None:
+                    processed_image = self.vae_transform.resize_transform(pil_img2rgb(context_image))
+                    gen_context = self.interleave_helper.update_context_image(processed_image, gen_context)
+                    inferred_image_shape = processed_image.size[::-1]
+                    cfg_text_context = deepcopy(gen_context)
+
+                text_output, token_ids = self.interleave_helper.gen_text(
+                    gen_context,
+                    max_length=max_length,
+                    do_sample=do_sample,
+                    temperature=temperature,
+                    return_tokens=True,
+                )
+
+                # 使用token ids重建包含特殊token的文本，防止例如<|vision_start|>被截断
+                if token_ids:
+                    decoded_with_special = self.tokenizer.decode(token_ids, skip_special_tokens=False)
+                else:
+                    decoded_with_special = text_output
+
+                gen_context_after_text = self.interleave_helper.update_context_text(decoded_with_special, gen_context)
+
+        token_ids = (token_ids or []) if 'token_ids' in locals() else []
+
+        print("🧪 helper文本输出:", text_output)
+        print("🧪 helper token序列:", token_ids)
+
+        return {
+            'text': text_output,
+            'text_with_special': decoded_with_special if 'decoded_with_special' in locals() else text_output,
+            'tokens': token_ids,
+            'gen_context': gen_context_after_text,
+            'cfg_text_context': cfg_text_context,
+            'cfg_img_context': cfg_img_context,
+            'image_shape': inferred_image_shape,
+        }
+
     def _unified_autoregressive_generation(
         self,
-        input_embeddings: torch.Tensor,
-        input_sequence_length: int,
+        encode_state: Dict[str, Any],
+        input_text: str,
         max_length: int,
         do_sample: bool,
         temperature: float,
@@ -242,201 +317,135 @@ class UnifiedAutoregressiveInferencer:
         print(f"🎯 开始统一自回归生成，最大长度: {max_length}")
         
         # 当前序列状态
-        current_embeddings = input_embeddings.clone()
         generated_sequence = []
-        step = 0
-        
-        # 生成状态跟踪
-        in_image_generation = False
-        current_image_patches = []
-        current_image_shape = None
-        patches_generated_in_current_image = 0
-        max_patches_per_image = None
-        
-        # 初始化 past_key_values 和相关参数
-        past_key_values = NaiveCache(self.model.config.llm_config.num_hidden_layers)
-        
-        while step < max_length:
-            # 计算当前步骤的KV cache参数
-            if step == 0:
-                # 第一步：处理完整输入序列，没有past key values
-                kv_lens = [0]
-                kv_indexes = torch.tensor([], dtype=torch.long, device=self.device)
-            else:
-                # 后续步骤：有past key values
-                kv_lens = [len(current_embeddings) - 1]  # past序列长度
-                kv_indexes = torch.arange(len(current_embeddings) - 1, device=self.device)
-            # 1. 预测下一个token（可能是文本、特殊token或图像patch）
-            if step == 0:
-                # 第一步：使用完整输入序列
-                query_embeddings = current_embeddings
-            else:
-                # 后续步骤：只使用最后一个token
-                query_embeddings = current_embeddings[-1:, :]
-                
-            next_token_info = self._predict_next_token_unified(
-                query_embeddings, 
-                in_image_generation,
-                patches_generated_in_current_image,
-                max_patches_per_image,
-                do_sample, 
-                temperature,
-                past_key_values,
-                kv_lens,
-                kv_indexes
-            )
-            
-            token_id = next_token_info.get('token_id')
-            token_type = next_token_info.get('token_type')
-            
-            print(f"第 {step+1} 步: 预测 {token_type}, token_id: {token_id}")
-            if token_type == 'special':
-                if token_id == self.start_of_image:
-                    print(f"   -> 预测到 start_of_image")
-                elif token_id == self.end_of_image:
-                    print(f"   -> 预测到 end_of_image")
-                elif token_id == self.eos_token_id:
-                    print(f"   -> 预测到 EOS")
-                else:
-                    print(f"   -> 预测到其他特殊token: {token_id}")
-            
-            # 2. 根据预测结果处理
-            if token_type == 'text':
-                # 普通文本token
-                token_embedding = self.model.language_model.model.embed_tokens(
-                    torch.tensor([token_id], device=self.device)
-                )
-                current_embeddings = torch.cat([current_embeddings, token_embedding], dim=0)
-                
-                generated_sequence.append({
-                    'type': 'text_token',
-                    'content': token_id
-                })
-                
-            elif token_type == 'special' and token_id == self.start_of_image:
-                # 模型预测要开始生成图像
-                print(f"🖼️  模型决定开始图像生成")
-                in_image_generation = True
-                current_image_shape = image_shapes
-                patches_generated_in_current_image = 0
-                
-                # 计算当前图像的最大patch数
-                H, W = image_shapes
-                h = H // self.model.latent_downsample
-                w = W // self.model.latent_downsample
-                max_patches_per_image = h * w
-                
-                # 添加<vision_start> token到序列
-                token_embedding = self.model.language_model.model.embed_tokens(
-                    torch.tensor([token_id], device=self.device)
-                )
-                current_embeddings = torch.cat([current_embeddings, token_embedding], dim=0)
-                
+        text_history = list(encode_state.get('text_token_history', []))
+        context_image = encode_state.get('context_image')
+
+        cfg_interval = kwargs.get('cfg_interval', (0.4, 1.0))
+        cfg_renorm_min = kwargs.get('cfg_renorm_min', 0.0)
+        cfg_renorm_type = kwargs.get('cfg_renorm_type', "global")
+        enable_taylorseer = kwargs.get('enable_taylorseer', False)
+
+        initial_contexts = None
+        if encode_state.get('gen_context') is not None:
+            initial_contexts = {
+                'gen_context': encode_state.get('gen_context'),
+                'cfg_text_context': encode_state.get('cfg_text_context'),
+                'cfg_img_context': encode_state.get('cfg_img_context'),
+                'image_shape': encode_state.get('image_shape'),
+            }
+
+        helper_outputs = self._generate_text_with_helper(
+            input_text=input_text,
+            context_image=context_image,
+            image_shape=image_shapes,
+            max_length=max_length,
+            do_sample=do_sample,
+            temperature=temperature,
+            initial_contexts=initial_contexts,
+        )
+
+        generated_tokens: List[int] = helper_outputs.get('tokens') or []
+        gen_context_for_image = helper_outputs.get('gen_context')
+        cfg_text_context = helper_outputs.get('cfg_text_context')
+        cfg_img_context = helper_outputs.get('cfg_img_context')
+        current_image_shape = helper_outputs.get('image_shape') or image_shapes
+        current_image_shape = tuple(current_image_shape)
+
+        if gen_context_for_image is None:
+            gen_context_for_image = self.interleave_helper.init_gen_context()
+        if cfg_text_context is None:
+            cfg_text_context = deepcopy(gen_context_for_image)
+        if cfg_img_context is None:
+            cfg_img_context = deepcopy(gen_context_for_image)
+
+        special_token_ids = {
+            v for v in self.new_token_ids.values() if isinstance(v, int)
+        }
+
+        for step, token_id in enumerate(generated_tokens):
+            if token_id == self.bos_token_id:
+                continue
+
+            if token_id == self.start_of_image:
+                print(f"第 {step+1} 步: 预测 special, token_id: {token_id} (start_of_image)")
+                print("🖼️  模型决定开始图像生成")
                 generated_sequence.append({
                     'type': 'special_token',
                     'content': token_id,
                     'token_name': 'start_of_image'
                 })
-                
-            elif token_type == 'special' and token_id == self.end_of_image:
-                # 模型预测要结束图像生成
-                print(f"🖼️  模型决定结束图像生成，已生成 {patches_generated_in_current_image} 个patches")
-                
-                # 完成图像生成
-                if current_image_patches:
-                    generated_image = self._finalize_image_generation(
-                        current_image_patches, current_image_shape,
-                        cfg_text_scale, cfg_img_scale, num_timesteps, timestep_shift
-                    )
-                    generated_sequence.append({
-                        'type': 'image',
-                        'content': generated_image
-                    })
-                    current_image_patches = []
-                
-                in_image_generation = False
-                patches_generated_in_current_image = 0
-                max_patches_per_image = None
-                
-                # 添加<vision_end> token到序列
-                token_embedding = self.model.language_model.model.embed_tokens(
-                    torch.tensor([token_id], device=self.device)
+                text_history.append(token_id)
+
+                generated_image = self._generate_image_with_helper(
+                    image_shape=current_image_shape,
+                    gen_context=gen_context_for_image,
+                    cfg_text_context=cfg_text_context,
+                    cfg_img_context=cfg_img_context,
+                    cfg_text_scale=cfg_text_scale,
+                    cfg_img_scale=cfg_img_scale,
+                    num_timesteps=num_timesteps,
+                    timestep_shift=timestep_shift,
+                    cfg_interval=cfg_interval,
+                    cfg_renorm_min=cfg_renorm_min,
+                    cfg_renorm_type=cfg_renorm_type,
+                    enable_taylorseer=enable_taylorseer,
                 )
-                current_embeddings = torch.cat([current_embeddings, token_embedding], dim=0)
-                
+                generated_sequence.append({
+                    'type': 'image',
+                    'content': generated_image
+                })
                 generated_sequence.append({
                     'type': 'special_token',
-                    'content': token_id,
+                    'content': self.end_of_image,
                     'token_name': 'end_of_image'
                 })
-                
-            elif token_type == 'image_patch':
-                # 生成图像patch（对应训练时的flow matching）
-                patch_data = self._generate_image_patch_unified(
-                    current_embeddings, 
-                    current_image_shape,
-                    patches_generated_in_current_image,
-                    cfg_text_scale,
-                    cfg_img_scale,
-                    past_key_values,
-                    kv_lens,
-                    kv_indexes
-                )
-                current_image_patches.append(patch_data)
-                patches_generated_in_current_image += 1
-                
-                # 添加patch embedding到序列
-                current_embeddings = torch.cat([
-                    current_embeddings, 
-                    patch_data['embedding']
-                ], dim=0)
-                
-                generated_sequence.append({
-                    'type': 'image_patch',
-                    'content': patch_data
-                })
-                
-                # 检查是否已生成所有patches
-                if patches_generated_in_current_image >= max_patches_per_image:
-                    print(f"📊 已生成所有 {max_patches_per_image} 个patches")
-                    # 下一步应该预测<vision_end>
-                
-            elif token_id == self.eos_token_id:
-                # 结束生成
-                print(f"🏁 遇到EOS token，停止生成")
+                text_history.append(self.end_of_image)
+                print("🖼️  通过InterleaveInferencer.gen_image完成整图生成")
+                break
+
+            if token_id == self.eos_token_id:
+                print(f"第 {step+1} 步: 预测 special, token_id: {token_id}")
+                print("🏁 遇到EOS token，停止生成")
                 generated_sequence.append({
                     'type': 'special_token',
                     'content': token_id,
                     'token_name': 'eos'
                 })
+                text_history.append(token_id)
                 break
-                
-            else:
-                # 其他特殊token
-                token_embedding = self.model.language_model.model.embed_tokens(
-                    torch.tensor([token_id], device=self.device)
-                )
-                current_embeddings = torch.cat([current_embeddings, token_embedding], dim=0)
-                
+
+            if token_id == self.end_of_image:
+                print(f"第 {step+1} 步: 预测 special, token_id: {token_id}")
+                generated_sequence.append({
+                    'type': 'special_token',
+                    'content': token_id,
+                    'token_name': 'end_of_image'
+                })
+                text_history.append(token_id)
+                continue
+
+            if token_id in special_token_ids:
+                debug_name = {
+                    self.bos_token_id: 'bos',
+                    self.eos_token_id: 'eos',
+                    self.start_of_image: 'start_of_image',
+                    self.end_of_image: 'end_of_image',
+                }.get(token_id, 'special')
+                print(f"第 {step+1} 步: 预测 special, token_id: {token_id} ({debug_name})")
                 generated_sequence.append({
                     'type': 'special_token',
                     'content': token_id
                 })
-            
-            step += 1
-        
-        # 处理未完成的图像生成
-        if in_image_generation and current_image_patches:
-            print(f"⚠️  生成未完成，强制完成图像生成")
-            generated_image = self._finalize_image_generation(
-                current_image_patches, current_image_shape,
-                cfg_text_scale, cfg_img_scale, num_timesteps, timestep_shift
-            )
+                text_history.append(token_id)
+                continue
+
             generated_sequence.append({
-                'type': 'image',
-                'content': generated_image
+                'type': 'text_token',
+                'content': token_id
             })
-        
+            text_history.append(token_id)
+
         print(f"✅ 自回归生成完成，共生成 {len(generated_sequence)} 个元素")
         return generated_sequence
     
@@ -563,29 +572,50 @@ class UnifiedAutoregressiveInferencer:
                     'hidden_state': last_hidden_state
                 }
                 
-                # 方案2：让模型决定（注释掉的代码）
-                # if do_sample:
-                #     import torch.nn.functional as F
-                #     probs = F.softmax(logits / temperature, dim=-1)
-                #     next_token = torch.multinomial(probs.squeeze(0), num_samples=1)
-                # else:
-                #     next_token = torch.argmax(logits, dim=-1)
-                # 
-                # token_id = next_token.item()
-                # if token_id == self.end_of_image:
-                #     return {
-                #         'token_id': token_id,
-                #         'token_type': 'special',
-                #         'logits': logits,
-                #         'hidden_state': last_hidden_state
-                #     }
-                # else:
-                #     # 继续生成patch（可能超过预期数量）
-                #     return {
-                #         'token_type': 'image_patch',
-                #         'hidden_state': last_hidden_state
-                #     }
-    
+
+
+    def _generate_image_with_helper(
+        self,
+        image_shape: Tuple[int, int],
+        gen_context: Dict[str, Any],
+        cfg_text_context: Dict[str, Any],
+        cfg_img_context: Dict[str, Any],
+        cfg_text_scale: float,
+        cfg_img_scale: float,
+        num_timesteps: int,
+        timestep_shift: float,
+        cfg_interval: Union[Tuple[float, float], List[float]],
+        cfg_renorm_min: float,
+        cfg_renorm_type: str,
+        enable_taylorseer: bool,
+    ) -> Image.Image:
+        """复用官方 InterleaveInferencer 的整图生成能力。"""
+        if isinstance(cfg_interval, list):
+            cfg_interval = tuple(cfg_interval)
+
+        autocast_ctx = (
+            torch.autocast(device_type=self.device.type, dtype=torch.bfloat16)
+            if self.device.type == "cuda" else nullcontext()
+        )
+
+        with autocast_ctx:
+            image = self.interleave_helper.gen_image(
+                image_shape=image_shape,
+                gen_context=gen_context,
+                cfg_text_scale=cfg_text_scale,
+                cfg_img_scale=cfg_img_scale,
+                cfg_text_precontext=deepcopy(cfg_text_context),
+                cfg_img_precontext=deepcopy(cfg_img_context),
+                cfg_interval=cfg_interval,
+                cfg_renorm_min=cfg_renorm_min,
+                cfg_renorm_type=cfg_renorm_type,
+                num_timesteps=num_timesteps,
+                timestep_shift=timestep_shift,
+                enable_taylorseer=enable_taylorseer,
+            )
+
+        return image
+
     def _generate_image_patch_unified(
         self, 
         current_embeddings: torch.Tensor, 
@@ -916,18 +946,28 @@ def load_bagel_model_for_inference(
         'vit_pos_embed'
     ]
     
-    if torch.cuda.device_count() == 1:
-        first_device = device_map.get(same_device_modules[0], "cuda:0")
-        for k in same_device_modules:
-            if k in device_map:
-                device_map[k] = first_device
-            else:
-                device_map[k] = "cuda:0"
+    fallback_device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    # 从自动推理的 device_map 中提取已有的第一个设备，作为兜底
+    inferred_devices = [dev for dev in device_map.values() if dev is not None]
+    if inferred_devices:
+        fallback_device = inferred_devices[0]
+    def _select_first_device() -> str:
+        first = device_map.get(same_device_modules[0])
+        if first is None:
+            return fallback_device
+        return first
+    if torch.cuda.device_count() <= 1:
+        first_device = device_map.get(same_device_modules[0], fallback_device)
+        for module_name in same_device_modules:
+            device_map[module_name] = first_device
     else:
-        first_device = device_map.get(same_device_modules[0])
-        for k in same_device_modules:
-            device_map[k] = first_device
-    
+        first_device = _select_first_device()
+        for module_name in same_device_modules:
+            device_map[module_name] = first_device
+
+    # 将VAE模型移动到主要设备，避免后续CPU/GPU不一致
+    vae_device = first_device if isinstance(first_device, str) else fallback_device
+    vae_model = vae_model.to(vae_device)
     # 8. 根据模式加载权重
     if mode == 1:  # 正常模式
         model = load_checkpoint_and_dispatch(
@@ -1003,6 +1043,10 @@ class UnifiedImageEditingInference:
             mode=mode,
             device=device
         )
+
+        # 确保VAE与主模型在同一设备
+        model_device = next(self.model.parameters()).device
+        self.vae_model = self.vae_model.to(model_device)
         
         # 创建推理器（保留原有的兼容性）
         self.inferencer = InterleaveInferencer(
@@ -1564,4 +1608,5 @@ def main():
 
 
 if __name__ == "__main__":
+    
     main()
